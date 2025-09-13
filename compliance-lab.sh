@@ -25,8 +25,10 @@ create_cluster() {
     --name $RANCHER_NAME \
     rancher/rancher:latest
 
-  echo ">>> Installing Longhorn..."
-  kubectl apply -f https://raw.githubusercontent.com/longhorn/longhorn/master/deploy/longhorn.yaml
+  echo ">>> Installing OpenEBS..."
+  kubectl create namespace openebs || true
+  kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml
+  kubectl patch storageclass openebs-hostpath -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
   echo ">>> Installing MinIO..."
   kubectl create ns minio || true
