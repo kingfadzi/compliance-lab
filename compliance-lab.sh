@@ -15,20 +15,19 @@ create_cluster() {
   k3d cluster create "$CLUSTER_NAME" --agents 1 --wait
   export KUBECONFIG=$(k3d kubeconfig write "$CLUSTER_NAME")
 
-  echo ">>> Deploying Rancher with SSL..."
-  docker run -d --restart=unless-stopped \
-    -p 8080:80 -p 8443:443 \
-    -v $CERT_FILE:/etc/rancher/ssl/cert.pem:ro \
-    -v $KEY_FILE:/etc/rancher/ssl/key.pem:ro \
-    -v $CA_FILE:/etc/rancher/ssl/cacerts.pem:ro \
-    --privileged \
-    --name $RANCHER_NAME \
-    rancher/rancher:latest
-
   echo ">>> Installing OpenEBS LocalPV..."
   kubectl create namespace openebs || true
-  kubectl apply -f https://openebs.github.io/charts/localpv-provisioner.yaml
+  kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml
   kubectl patch storageclass openebs-hostpath -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+  echo ">>> Installing Rancher..."
+  kubectl create namespace cattle-system || true
+  helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
+  helm upgrade --install rancher rancher-stable/rancher \
+    --namespace cattle-system \
+    --set hostname=$DOMAIN \
+    --set bootstrapPassword=admin \
+    --set ingress.tls.source=secret
 
   echo ">>> Installing MinIO..."
   kubectl create ns minio || true
@@ -86,9 +85,6 @@ create_cluster() {
 }
 
 destroy_cluster() {
-  echo ">>> Removing Rancher..."
-  docker rm -f $RANCHER_NAME || true
-
   echo ">>> Deleting k3d cluster..."
   k3d cluster delete "$CLUSTER_NAME" || true
 
