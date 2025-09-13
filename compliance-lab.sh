@@ -25,9 +25,9 @@ create_cluster() {
     --name $RANCHER_NAME \
     rancher/rancher:latest
 
-  echo ">>> Installing OpenEBS..."
+  echo ">>> Installing OpenEBS LocalPV..."
   kubectl create namespace openebs || true
-  kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml
+  kubectl apply -f https://openebs.github.io/charts/localpv-provisioner.yaml
   kubectl patch storageclass openebs-hostpath -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
   echo ">>> Installing MinIO..."
