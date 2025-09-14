@@ -17,7 +17,22 @@ create_cluster() {
 
   echo ">>> Installing OpenEBS LocalPV Hostpath..."
   kubectl apply -f https://raw.githubusercontent.com/openebs/dynamic-localpv-provisioner/develop/deploy/kubectl/openebs-operator-lite.yaml
-  kubectl patch storageclass openebs-hostpath -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
+
+  echo ">>> Creating OpenEBS hostpath StorageClass..."
+  kubectl apply -f - <<EOF
+apiVersion: storage.k8s.io/v1
+kind: StorageClass
+metadata:
+  name: openebs-hostpath
+  annotations:
+    storageclass.kubernetes.io/is-default-class: "true"
+provisioner: openebs.io/local
+parameters:
+  StorageType: "hostpath"
+  BasePath: "/var/openebs/local"
+volumeBindingMode: WaitForFirstConsumer
+reclaimPolicy: Delete
+EOF
 
   echo ">>> Installing Rancher..."
   kubectl create namespace cattle-system || true
