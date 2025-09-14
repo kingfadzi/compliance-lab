@@ -62,7 +62,7 @@ EOF
     --set resources.requests.memory=512Mi \
     --set resources.requests.cpu=250m
   kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio
-  kubectl wait --for=condition=ready --timeout=300s pod -l app.kubernetes.io/name=minio -n minio
+  kubectl wait --for=condition=ready --timeout=300s pod -l app=minio -n minio
 
   echo ">>> Installing Velero..."
   velero install \
