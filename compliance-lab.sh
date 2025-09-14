@@ -34,6 +34,9 @@ volumeBindingMode: WaitForFirstConsumer
 reclaimPolicy: Delete
 EOF
 
+  echo ">>> Installing cert-manager..."
+  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+
   echo ">>> Installing Rancher..."
   kubectl create namespace cattle-system || true
   helm repo add rancher-stable https://releases.rancher.com/server-charts/stable
