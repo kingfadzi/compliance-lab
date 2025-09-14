@@ -36,6 +36,7 @@ EOF
 
   echo ">>> Installing cert-manager..."
   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+  kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
 
   echo ">>> Installing Rancher..."
   kubectl create namespace cattle-system || true
