@@ -15,9 +15,8 @@ create_cluster() {
   k3d cluster create "$CLUSTER_NAME" --agents 1 --wait
   export KUBECONFIG=$(k3d kubeconfig write "$CLUSTER_NAME")
 
-  echo ">>> Installing OpenEBS LocalPV..."
-  kubectl create namespace openebs || true
-  kubectl apply -f https://openebs.github.io/charts/openebs-operator.yaml
+  echo ">>> Installing OpenEBS LocalPV Hostpath..."
+  kubectl apply -f https://raw.githubusercontent.com/openebs/dynamic-localpv-provisioner/develop/deploy/kubectl/openebs-operator-lite.yaml
   kubectl patch storageclass openebs-hostpath -p '{"metadata":{"annotations":{"storageclass.kubernetes.io/is-default-class":"true"}}}'
 
   echo ">>> Installing Rancher..."
@@ -27,7 +26,8 @@ create_cluster() {
     --namespace cattle-system \
     --set hostname=$DOMAIN \
     --set bootstrapPassword=admin \
-    --set ingress.tls.source=secret
+    --set ingress.tls.source=rancher \
+    --set replicas=1
 
   echo ">>> Installing MinIO..."
   kubectl create ns minio || true
