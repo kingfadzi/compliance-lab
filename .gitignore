@@ -1,0 +1,6 @@
+# Ignore Rancher credentials file(s)
+rancher.env
+rancher.env~
+
+# Runtime credentials for Velero S3 (generated)
+manifests/minio-credentials
