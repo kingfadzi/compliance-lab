@@ -47,6 +47,8 @@ EOF
     --set bootstrapPassword=admin \
     --set ingress.tls.source=rancher \
     --set replicas=1
+  kubectl wait --for=condition=available --timeout=600s deployment/rancher -n cattle-system
+  kubectl wait --for=condition=available --timeout=300s deployment/rancher-webhook -n cattle-system
 
   echo ">>> Installing MinIO (single instance)..."
   kubectl create ns minio || true
