@@ -53,7 +53,8 @@ EOF
   helm repo add minio https://charts.min.io/
   helm upgrade --install minio minio/minio -n minio \
     --set accessKey=myaccesskey,secretKey=mysecretkey \
-    --set defaultBucket.enabled=true
+    --set defaultBucket.enabled=false
+  kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio
 
   echo ">>> Installing Velero..."
   velero install \
