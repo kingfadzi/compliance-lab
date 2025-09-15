@@ -9,8 +9,9 @@ RANCHER_NAME="rancher"
 K3S_INGRESS_DOMAIN="dev.butterflycluster.com"
 
 # --- Cloudflare Configuration (for Let's Encrypt DNS-01 challenges) ---
-CLOUDFLARE_API_TOKEN=""
-CLOUDFLARE_EMAIL=""
+# Use environment variables if set, otherwise default to empty
+CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
+CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL:-}"
 
 # --- MinIO Credentials (used for Velero S3 backend) ---
 MINIO_ACCESS_KEY="myaccesskey"
@@ -112,10 +113,18 @@ configure_cloudflare() {
   local default_email="${CLOUDFLARE_EMAIL:-}"
   local default_token="${CLOUDFLARE_API_TOKEN:-}"
 
-  read -p "Enter your Cloudflare email address${default_email:+ [$default_email]}: " cf_email || true
+  if [ -n "$default_email" ]; then
+    read -p "Enter your Cloudflare email address [$default_email]: " cf_email || true
+  else
+    read -p "Enter your Cloudflare email address: " cf_email || true
+  fi
   cf_email=${cf_email:-$default_email}
 
-  read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required)${default_token:+ [***hidden***]}: " cf_token || true
+  if [ -n "$default_token" ]; then
+    read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required) [***hidden***]: " cf_token || true
+  else
+    read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required): " cf_token || true
+  fi
   echo
   cf_token=${cf_token:-$default_token}
 
