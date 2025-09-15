@@ -1,0 +1,22 @@
+---
+# Example VirtualService for Keycloak using the wildcard gateway
+# This shows how applications can leverage the dev-wildcard-gateway for HTTPS
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  hosts:
+  - keycloak.dev.butterflycluster.com
+  gateways:
+  - istio-system/dev-wildcard-gateway  # Reference the wildcard gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: keycloak
+        port:
+          number: 80

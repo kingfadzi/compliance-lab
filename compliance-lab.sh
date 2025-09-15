@@ -6,7 +6,11 @@ CLUSTER_NAME="compliance-lab"
 RANCHER_NAME="rancher"
 # This domain is used for services inside the k3s cluster, like Keycloak.
 # The external Rancher instance will have its own separate URL.
-K3S_INGRESS_DOMAIN="charon.butterflycluster.com"
+K3S_INGRESS_DOMAIN="dev.butterflycluster.com"
+
+# --- Cloudflare Configuration (for Let's Encrypt DNS-01 challenges) ---
+CLOUDFLARE_API_TOKEN=""
+CLOUDFLARE_EMAIL=""
 
 # --- MinIO Credentials (used for Velero S3 backend) ---
 MINIO_ACCESS_KEY="myaccesskey"
@@ -99,6 +103,31 @@ check_deps() {
 
 # --- Configuration Management ---
 
+configure_cloudflare() {
+  echo "--- Cloudflare Configuration for SSL Certificates ---"
+  echo "This configures Cloudflare API access for Let's Encrypt DNS-01 challenges."
+  echo
+
+  read -p "Enter your Cloudflare email address: " cf_email || true
+  read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required): " cf_token || true
+  echo
+
+  if [ -z "$cf_email" ] || [ -z "$cf_token" ]; then
+    echo "Cloudflare email and API token cannot be empty."
+    return 1
+  fi
+
+  CLOUDFLARE_EMAIL="$cf_email"
+  CLOUDFLARE_API_TOKEN="$cf_token"
+
+  echo "Cloudflare configuration set successfully."
+}
+
+configure_all() {
+  configure_cloudflare
+  configure_rancher
+}
+
 configure_rancher() {
   echo "--- Rancher API Configuration ---"
   local default_url
@@ -141,6 +170,10 @@ export CERT_DIR="/etc/ssl"
 export CERT_FILE="/etc/ssl/butterflycluster_com.crt.pem"
 export KEY_FILE="/etc/ssl/butterflycluster_com.key.pem"
 export CA_FILE="/etc/ssl/butterflycluster_com.ca-bundle"
+
+# Cloudflare Configuration (for Let's Encrypt DNS-01 challenges)
+export CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
+export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
 EOL
       echo "Configuration saved successfully to rancher.env."
       return
@@ -209,6 +242,10 @@ export CERT_DIR="/etc/ssl"
 export CERT_FILE="/etc/ssl/butterflycluster_com.crt.pem"
 export KEY_FILE="/etc/ssl/butterflycluster_com.key.pem"
 export CA_FILE="/etc/ssl/butterflycluster_com.ca-bundle"
+
+# Cloudflare Configuration (for Let's Encrypt DNS-01 challenges)
+export CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
+export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
 EOL
   echo "Configuration saved successfully to rancher.env."
 }
@@ -554,6 +591,25 @@ EOF
   kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
   kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
 
+  echo ">>> Configuring SSL certificates with Let's Encrypt and Cloudflare..."
+  if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_EMAIL" ]; then
+    echo "WARNING: Cloudflare credentials not configured. SSL certificates will not be automatically issued."
+    echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
+  else
+    # Update the Cloudflare issuer manifest with actual credentials
+    sed -e "s/api-token: \"\"/api-token: \"${CLOUDFLARE_API_TOKEN}\"/" \
+        -e "s/email: \"\"/email: \"${CLOUDFLARE_EMAIL}\"/" \
+        manifests/cloudflare-issuer.yaml | kubectl apply -f -
+
+    # Wait for ClusterIssuer to be ready
+    echo "Waiting for ClusterIssuer to be ready..."
+    kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=300s || true
+
+    # Apply wildcard certificate
+    kubectl apply -f manifests/wildcard-certificate.yaml
+    echo "Wildcard certificate requested. It may take a few minutes to be issued."
+  fi
+
   echo ">>> Installing MinIO (single instance)..."
   kubectl create ns minio || true
   helm repo add minio https://charts.min.io/
@@ -634,12 +690,15 @@ EOF
   kubectl -n istio-system rollout status deploy/istio-ingressgateway --timeout=600s || true
   kubectl -n istio-system rollout status deploy/istio-egressgateway --timeout=600s || true
 
+  echo ">>> Configuring Istio Gateway for SSL termination..."
+  kubectl apply -f manifests/istio-gateway.yaml
+
   echo ">>> Installing Keycloak..."
   helm repo add codecentric https://codecentric.github.io/helm-charts
   helm upgrade --install keycloak codecentric/keycloakx -n keycloak --create-namespace \
     --set replicas=1 \
     --set ingress.enabled=true \
-    --set ingress.hosts[0].host=$K3S_INGRESS_DOMAIN \
+    --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
     --set ingress.hosts[0].paths[0].path=/
 
   echo ">>> Installing Vault..."
@@ -704,6 +763,24 @@ EOF
   register_cluster
 
   echo ">>> Cluster ready!"
+  echo
+  echo "=== SSL Certificate Configuration ==="
+  if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL" ]; then
+    echo "✓ Wildcard SSL certificate configured for *.dev.butterflycluster.com"
+    echo "  Certificate will be stored as: istio-system/dev-wildcard-tls"
+    echo "  Check certificate status: kubectl get certificate -n istio-system"
+    echo
+    echo "📋 DNS Configuration Required:"
+    echo "  Make sure these DNS records point to your cluster's ingress IP:"
+    echo "  - *.dev.butterflycluster.com -> [your-cluster-ingress-ip]"
+    echo "  - keycloak.dev.butterflycluster.com -> [your-cluster-ingress-ip]"
+    echo
+    echo "🔗 Access Applications:"
+    echo "  - Keycloak: https://keycloak.dev.butterflycluster.com"
+    echo "  - Add more apps with VirtualServices referencing 'istio-system/dev-wildcard-gateway'"
+  else
+    echo "⚠️  SSL certificates not configured. Run './compliance-lab.sh configure' to set up Cloudflare."
+  fi
 }
 
 destroy_cluster() {
@@ -742,10 +819,16 @@ case "${1:-}" in
   rancher-up) rancher_up ;; 
   rancher-down) rancher_down ;; 
   rancher-reset) rancher_reset ;; 
-  configure) configure_rancher ;; 
+  configure) configure_all ;; 
   cleanup) cleanup ;;
   *) 
     echo "Usage: $0 {up|down|reset|rancher-up|rancher-down|rancher-reset|configure|cleanup}"
+    echo
+    echo "SSL Certificate Features:"
+    echo "  • Automatic wildcard SSL certificates for *.dev.butterflycluster.com"
+    echo "  • Let's Encrypt integration with Cloudflare DNS-01 challenges"
+    echo "  • Istio Gateway configured for HTTPS termination"
+    echo "  • Run 'configure' command to set up Cloudflare API credentials"
     echo
     echo "Teardown cleanup options:"
     echo "  AUTO_DOCKER_PRUNE=true           Auto-prune Docker on teardown"

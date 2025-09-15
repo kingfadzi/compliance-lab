@@ -1,0 +1,20 @@
+---
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dev-wildcard-cert
+  namespace: istio-system
+spec:
+  # Secret names are automatically prefixed with the Certificate name when certificate is created
+  secretName: dev-wildcard-tls
+  issuerRef:
+    name: letsencrypt-prod
+    kind: ClusterIssuer
+  commonName: "*.dev.butterflycluster.com"
+  dnsNames:
+  - "*.dev.butterflycluster.com"
+  - "dev.butterflycluster.com"
+  # Optional: add subject alternative names for specific services if needed
+  # - "keycloak.dev.butterflycluster.com"
+  # - "kibana.dev.butterflycluster.com"
+  # - "grafana.dev.butterflycluster.com"

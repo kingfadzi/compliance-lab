@@ -1,0 +1,71 @@
+# Example: How to create VirtualServices for any application to use the wildcard SSL certificate
+#
+# 1. All applications under *.dev.butterflycluster.com automatically get HTTPS via the wildcard cert
+# 2. Just create a VirtualService referencing istio-system/dev-wildcard-gateway
+# 3. No need to manage individual certificates
+#
+# Example for a hypothetical "myapp" service:
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: myapp
+  namespace: myapp-namespace  # Your app's namespace
+spec:
+  hosts:
+  - myapp.dev.butterflycluster.com  # Your subdomain
+  gateways:
+  - istio-system/dev-wildcard-gateway  # Use the wildcard gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: myapp-service  # Your app's service name
+        port:
+          number: 80  # Your app's service port
+
+# Alternatively, for Grafana (if not using ingress):
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: grafana
+  namespace: monitoring
+spec:
+  hosts:
+  - grafana.dev.butterflycluster.com
+  gateways:
+  - istio-system/dev-wildcard-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: kube-prometheus-stack-grafana
+        port:
+          number: 80
+
+# For Kibana:
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: kibana
+  namespace: elk
+spec:
+  hosts:
+  - kibana.dev.butterflycluster.com
+  gateways:
+  - istio-system/dev-wildcard-gateway
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: kibana-kibana
+        port:
+          number: 5601
