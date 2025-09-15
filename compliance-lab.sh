@@ -108,9 +108,16 @@ configure_cloudflare() {
   echo "This configures Cloudflare API access for Let's Encrypt DNS-01 challenges."
   echo
 
-  read -p "Enter your Cloudflare email address: " cf_email || true
-  read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required): " cf_token || true
+  # Use environment variables as defaults if available
+  local default_email="${CLOUDFLARE_EMAIL:-}"
+  local default_token="${CLOUDFLARE_API_TOKEN:-}"
+
+  read -p "Enter your Cloudflare email address${default_email:+ [$default_email]}: " cf_email || true
+  cf_email=${cf_email:-$default_email}
+
+  read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required)${default_token:+ [***hidden***]}: " cf_token || true
   echo
+  cf_token=${cf_token:-$default_token}
 
   if [ -z "$cf_email" ] || [ -z "$cf_token" ]; then
     echo "Cloudflare email and API token cannot be empty."
