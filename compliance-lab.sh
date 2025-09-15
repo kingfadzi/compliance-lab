@@ -621,9 +621,7 @@ EOF
     echo "Waiting for ClusterIssuer to be ready..."
     kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=300s || true
 
-    # Apply wildcard certificate
-    kubectl apply -f manifests/wildcard-certificate.yaml
-    echo "Wildcard certificate requested. It may take a few minutes to be issued."
+    echo "Cloudflare ClusterIssuer configured. Wildcard certificate will be applied after Istio installation."
   fi
 
   echo ">>> Installing MinIO (single instance)..."
@@ -708,6 +706,14 @@ EOF
 
   echo ">>> Configuring Istio Gateway for SSL termination..."
   kubectl apply -f manifests/istio-gateway.yaml
+
+  # Apply wildcard certificate now that istio-system namespace exists
+  if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL" ]; then
+    echo ">>> Requesting wildcard SSL certificate..."
+    kubectl apply -f manifests/wildcard-certificate.yaml
+    echo "Wildcard certificate requested. It may take a few minutes to be issued."
+    echo "Check status with: kubectl get certificate -n istio-system"
+  fi
 
   echo ">>> Installing Keycloak..."
   helm repo add codecentric https://codecentric.github.io/helm-charts
