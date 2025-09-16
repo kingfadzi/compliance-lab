@@ -646,7 +646,7 @@ EOF
     cat <<EOF | kubectl apply -f -
 ---
 apiVersion: cert-manager.io/v1
-sedkind: ClusterIssuer
+kind: ClusterIssuer
 metadata:
   name: letsencrypt-staging
 spec:
