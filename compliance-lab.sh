@@ -781,40 +781,42 @@ EOF
     fi
   fi
 
-  echo ">>> Installing MinIO (single instance)..."
-  kubectl create ns minio || true
-  helm repo add minio https://charts.min.io/
-  helm upgrade --install minio minio/minio -n minio \
-    --set mode=standalone \
-    --set replicas=1 \
-    --set auth.rootUser=${MINIO_ACCESS_KEY} \
-    --set auth.rootPassword=${MINIO_SECRET_KEY} \
-    --set defaultBuckets="velero" \
-    --set persistence.enabled=true \
-    --set persistence.size=5Gi \
-    --set resources.requests.memory=512Mi \
-    --set resources.requests.cpu=250m
-  kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio
-  kubectl wait --for=condition=ready --timeout=300s pod -l app=minio -n minio
+  echo ">>> Skipping MinIO installation (temporarily disabled for debugging)"
+  # echo ">>> Installing MinIO (single instance)..."
+  # kubectl create ns minio || true
+  # helm repo add minio https://charts.min.io/
+  # helm upgrade --install minio minio/minio -n minio \
+  #   --set mode=standalone \
+  #   --set replicas=1 \
+  #   --set auth.rootUser=${MINIO_ACCESS_KEY} \
+  #   --set auth.rootPassword=${MINIO_SECRET_KEY} \
+  #   --set defaultBuckets="velero" \
+  #   --set persistence.enabled=true \
+  #   --set persistence.size=5Gi \
+  #   --set resources.requests.memory=512Mi \
+  #   --set resources.requests.cpu=250m
+  # kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio
+  # kubectl wait --for=condition=ready --timeout=300s pod -l app=minio -n minio
 
-  echo ">>> Installing Velero..."
-  # Ensure MinIO credentials file exists for Velero's AWS plugin
-  mkdir -p ./manifests
-  if [ ! -f ./manifests/minio-credentials ]; then
-    cat > ./manifests/minio-credentials <<EOF
-[default]
-aws_access_key_id = ${MINIO_ACCESS_KEY}
-aws_secret_access_key = ${MINIO_SECRET_KEY}
-EOF
-    chmod 600 ./manifests/minio-credentials || true
-  fi
-  velero install \
-    --provider aws \
-    --plugins velero/velero-plugin-for-aws:v1.8.0 \
-    --bucket velero \
-    --secret-file ./manifests/minio-credentials \
-    --use-volume-snapshots=false \
-    --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000
+  echo ">>> Skipping Velero installation (disabled due to MinIO dependency)"
+  # echo ">>> Installing Velero..."
+  # # Ensure MinIO credentials file exists for Velero's AWS plugin
+  # mkdir -p ./manifests
+  # if [ ! -f ./manifests/minio-credentials ]; then
+  #   cat > ./manifests/minio-credentials <<EOF
+  # [default]
+  # aws_access_key_id = ${MINIO_ACCESS_KEY}
+  # aws_secret_access_key = ${MINIO_SECRET_KEY}
+  # EOF
+  #   chmod 600 ./manifests/minio-credentials || true
+  # fi
+  # velero install \
+  #   --provider aws \
+  #   --plugins velero/velero-plugin-for-aws:v1.8.0 \
+  #   --bucket velero \
+  #   --secret-file ./manifests/minio-credentials \
+  #   --use-volume-snapshots=false \
+  #   --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000
 
   echo ">>> Prechecking Istio..."
   istioctl x precheck || true
@@ -872,22 +874,24 @@ EOF
     echo "Check status with: kubectl get certificate -n istio-system"
   fi
 
-  echo ">>> Installing Keycloak..."
-  helm repo add codecentric https://codecentric.github.io/helm-charts
-  helm upgrade --install keycloak codecentric/keycloakx -n keycloak --create-namespace \
-    --set replicas=1 \
-    --set ingress.enabled=true \
-    --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
-    --set ingress.hosts[0].paths[0].path=/ \
-    --set args='{start-dev}'
+  echo ">>> Skipping Keycloak installation (temporarily disabled for debugging)"
+  # echo ">>> Installing Keycloak..."
+  # helm repo add codecentric https://codecentric.github.io/helm-charts
+  # helm upgrade --install keycloak codecentric/keycloakx -n keycloak --create-namespace \
+  #   --set replicas=1 \
+  #   --set ingress.enabled=true \
+  #   --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
+  #   --set ingress.hosts[0].paths[0].path=/ \
+  #   --set args='{start-dev}'
 
-  echo ">>> Applying Keycloak VirtualService..."
-  kubectl apply -f manifests/keycloak-virtualservice.yaml
+  # echo ">>> Applying Keycloak VirtualService..."
+  # kubectl apply -f manifests/keycloak-virtualservice.yaml
 
-  echo ">>> Installing Vault..."
-  helm repo add hashicorp https://helm.releases.hashicorp.com
-  helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
-    --set server.dev.enabled=true
+  echo ">>> Skipping Vault installation (temporarily disabled for debugging)"
+  # echo ">>> Installing Vault..."
+  # helm repo add hashicorp https://helm.releases.hashicorp.com
+  # helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
+  #   --set server.dev.enabled=true
 
   echo ">>> Skipping ELK installation (temporarily disabled for debugging)"
   # echo ">>> Installing ELK (minimal, tuned for k3d)..."
@@ -926,25 +930,28 @@ EOF
   #   --set backend.type=es \
   #   --set backend.es.host=elasticsearch-master.elk.svc.cluster.local
 
-  echo ">>> Installing Prometheus Operator (minimal)..."
-  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-  helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
-    --set prometheus.prometheusSpec.replicas=1 \
-    --set prometheus.prometheusSpec.resources.requests.cpu=250m \
-    --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
-    --set prometheus.prometheusSpec.retention=7d \
-    --set alertmanager.alertmanagerSpec.replicas=1 \
-    --set alertmanager.alertmanagerSpec.resources.requests.cpu=100m \
-    --set alertmanager.alertmanagerSpec.resources.requests.memory=128Mi \
-    --set grafana.replicas=1 \
-    --set grafana.resources.requests.cpu=100m \
-    --set grafana.resources.requests.memory=128Mi
+  echo ">>> Skipping Prometheus Operator installation (temporarily disabled for debugging)"
+  # echo ">>> Installing Prometheus Operator (minimal)..."
+  # helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
+  # helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+  #   --set prometheus.prometheusSpec.replicas=1 \
+  #   --set prometheus.prometheusSpec.resources.requests.cpu=250m \
+  #   --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
+  #   --set prometheus.prometheusSpec.retention=7d \
+  #   --set alertmanager.alertmanagerSpec.replicas=1 \
+  #   --set alertmanager.alertmanagerSpec.resources.requests.cpu=100m \
+  #   --set alertmanager.alertmanagerSpec.resources.requests.memory=128Mi \
+  #   --set grafana.replicas=1 \
+  #   --set grafana.resources.requests.cpu=100m \
+  #   --set grafana.resources.requests.memory=128Mi
 
-  echo ">>> Applying compliance manifests..."
-  kubectl apply -f manifests/compliance-system.yaml
-  kubectl apply -f manifests/compliance-test.yaml
+  echo ">>> Skipping compliance manifests (temporarily disabled for debugging)"
+  # echo ">>> Applying compliance manifests..."
+  # kubectl apply -f manifests/compliance-system.yaml
+  # kubectl apply -f manifests/compliance-test.yaml
 
-  register_cluster
+  echo ">>> Skipping Rancher cluster registration (temporarily disabled for debugging)"
+  # register_cluster
 
   echo ">>> Cluster ready!"
   echo
