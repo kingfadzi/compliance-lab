@@ -7,9 +7,13 @@ metadata:
 spec:
   # Secret names are automatically prefixed with the Certificate name when certificate is created
   secretName: dev-wildcard-tls
+  privateKey:
+    rotationPolicy: Never
   issuerRef:
     name: letsencrypt-prod
     kind: ClusterIssuer
+  # Bypass Let's Encrypt "exact set" duplicate limit by
+  # including both the wildcard and the apex name.
   commonName: "*.dev.butterflycluster.com"
   dnsNames:
   - "*.dev.butterflycluster.com"

@@ -31,6 +31,23 @@ RANCHER_DIR=${RANCHER_DIR:-/var/lib/rancher}
 # When true, SSL setup must succeed or the script fails.
 # When false, SSL setup failures are warned but script continues.
 REQUIRE_SSL=${REQUIRE_SSL:-true}
+# When true, delete any existing ACME TXT records before requesting certs
+CLEANUP_ACME_DNS=${CLEANUP_ACME_DNS:-false}
+# When true, wait for the wildcard Certificate to become Ready
+WAIT_FOR_CERT_READY=${WAIT_FOR_CERT_READY:-true}
+# When true, restart CoreDNS before requesting certs to clear negative caches
+FLUSH_COREDNS_ON_ISSUANCE=${FLUSH_COREDNS_ON_ISSUANCE:-false}
+# When true, attempt to reuse existing certs by restoring backups and skipping issuance if valid
+REUSE_EXISTING_CERTS=${REUSE_EXISTING_CERTS:-true}
+# Use Let's Encrypt staging issuer for testing (untrusted, high rate limits).
+# Set to true to switch the wildcard Certificate's issuer to 'letsencrypt-staging'.
+USE_STAGING_SSL=${USE_STAGING_SSL:-false}
+# When true, configure cert-manager to use public DNS resolvers for DNS01 propagation checks.
+# This avoids slow/negative caching from cluster DNS.
+USE_DNS_PUBLIC_RESOLVERS=${USE_DNS_PUBLIC_RESOLVERS:-true}
+# Minimum days remaining on an existing cert to consider early rotation.
+# Set default to 0 so we do NOT rotate unless the cert is actually expired.
+MIN_CERT_VALID_DAYS=${MIN_CERT_VALID_DAYS:-0}
 
 # --- Local SSL Certificate Paths ---
 # Used for the external Rancher Docker container
@@ -52,6 +69,7 @@ load_config() {
   if [ -f "rancher.env" ]; then
     source "rancher.env"
   fi
+  # removed stray fi from legacy block
 }
 
 ensure_rancher_available() {
@@ -61,6 +79,7 @@ ensure_rancher_available() {
     echo "ERROR: RANCHER_URL not set. Run './compliance-lab.sh configure' first."
     exit 1
   fi
+  # removed: stray fi from legacy block
 
   echo ">>> Ensuring Rancher is running at: ${url}"
   if ! docker ps -q -f name=^/${RANCHER_NAME}$ >/dev/null; then
@@ -154,6 +173,175 @@ cleanup_failed_ssl_setup() {
   echo ">>> SSL setup cleanup completed"
 }
 
+cleanup_acme_dns_records() {
+  local zone_id="${CLOUDFLARE_ZONE_ID:-}"
+  local api_token="${CLOUDFLARE_API_TOKEN:-}"
+  local target="_acme-challenge.${K3S_INGRESS_DOMAIN}"
+  if [ -z "$zone_id" ] || [ -z "$api_token" ]; then
+    echo "WARNING: Skipping ACME DNS cleanup (Cloudflare token/zone not configured)."
+    return 0
+  fi
+  echo ">>> Searching for existing ACME TXT records at ${target} in Cloudflare..."
+  local list_resp
+  list_resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=TXT&name=${target}" \
+    -H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json")
+  local success
+  success=$(echo "$list_resp" | jq -r '.success')
+  if [ "$success" != "true" ]; then
+    echo "WARNING: Failed to list ACME TXT records (Cloudflare API error). Response: $(echo "$list_resp" | jq -c '.')"
+    return 0
+  fi
+  local ids
+  ids=($(echo "$list_resp" | jq -r '.result[]?.id'))
+  if [ ${#ids[@]} -eq 0 ]; then
+    echo ">>> No ACME TXT records to delete."
+    return 0
+  fi
+  echo ">>> Deleting ${#ids[@]} ACME TXT record(s) at ${target}..."
+  local id resp del_ok
+  for id in "${ids[@]}"; do
+    resp=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${id}" \
+      -H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json")
+    del_ok=$(echo "$resp" | jq -r '.success')
+    if [ "$del_ok" = "true" ]; then
+      echo " - Deleted record id ${id}"
+    else
+      echo " - Failed to delete record id ${id}. Response: $(echo "$resp" | jq -c '.')"
+    fi
+  done
+}
+
+wait_for_certificate_ready() {
+  local ns="$1"; shift
+  local name="$1"; shift
+  local timeout_secs="${1:-600}"; shift || true
+  echo ">>> Waiting for Certificate ${ns}/${name} to become Ready (timeout ${timeout_secs}s)..."
+  local start_ts=$(date +%s)
+  local last_log_ts=$start_ts
+  local nudge_done="false"
+  local iter=0
+  local max_iters=$(( timeout_secs / 5 ))
+  [ $max_iters -le 0 ] && max_iters=1
+  while true; do
+    if kubectl -n "$ns" get certificate "$name" >/dev/null 2>&1; then
+      local cert_json cond reason message
+      cert_json=$(kubectl -n "$ns" get certificate "$name" -o json 2>/dev/null || echo '{}')
+      cond=$(echo "$cert_json" | jq -r '.status.conditions[]? | select(.type=="Ready") | .status' 2>/dev/null || true)
+      reason=$(echo "$cert_json" | jq -r '.status.conditions[]? | select(.type=="Ready") | .reason // empty' 2>/dev/null || true)
+      message=$(echo "$cert_json" | jq -r '.status.conditions[]? | select(.type=="Ready") | .message // empty' 2>/dev/null || true)
+      if [ "$cond" = "True" ]; then
+        echo ">>> Certificate is Ready."
+        return 0
+      fi
+      # Periodic debug every 15s
+      local now=$(date +%s)
+      if [ $((now - last_log_ts)) -ge 15 ]; then
+        last_log_ts=$now
+        # Summarize current ACME flow objects
+        local req_cnt ord_cnt chal_cnt chal_summary issuer_ready
+        req_cnt=$(kubectl -n "$ns" get certificaterequests.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 0)
+        ord_cnt=$(kubectl -n "$ns" get orders.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 0)
+        chal_cnt=$(kubectl -n "$ns" get challenges.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 0)
+        chal_summary=$(kubectl -n "$ns" get challenges.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq -r '[.items[]? | {dnsName:.spec.dnsName, presented:.status.presented, reason:.status.reason, state:.status.state}]' 2>/dev/null || echo '[]')
+        issuer_ready=$(kubectl get clusterissuer letsencrypt-prod -o json 2>/dev/null | jq -r '.status.conditions[]? | select(.type=="Ready") | .status' 2>/dev/null || echo "")
+        echo "... cert Ready=${cond:-Unknown} reason='${reason}'"
+        echo "... CRs=${req_cnt} Orders=${ord_cnt} Challenges=${chal_cnt} IssuerReady=${issuer_ready}"
+        echo "... Challenge summary: ${chal_summary}"
+        # If no activity after ~90s, force a reconcile by bumping an annotation
+        if [ "$nudge_done" != "true" ] && [ $((now - start_ts)) -ge 90 ] && [ "${req_cnt:-0}" -eq 0 ] && [ "${ord_cnt:-0}" -eq 0 ] && [ "${chal_cnt:-0}" -eq 0 ]; then
+          echo ">>> No issuance activity detected after 90s; nudging cert-manager to reconcile certificate..."
+          kubectl -n "$ns" annotate certificate "$name" cert-manager.io/renewal-reason="force-issue-$(date +%s)" --overwrite || true
+          nudge_done="true"
+        fi
+      fi
+    fi
+    local now=$(date +%s)
+    iter=$((iter+1))
+    if [ $((now-start_ts)) -ge "$timeout_secs" ] || [ $iter -ge $max_iters ]; then
+      echo "ERROR: Certificate ${ns}/${name} not Ready after ${timeout_secs}s."
+      echo ">>> Certificate describe:"
+      kubectl -n "$ns" describe certificate "$name" || true
+      echo ">>> CertificateRequests:"
+      kubectl -n "$ns" get certificaterequests.cert-manager.io -l cert-manager.io/certificate-name="$name" -o wide || true
+      echo ">>> Orders:"
+      kubectl -n "$ns" get orders.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o wide || true
+      echo ">>> Challenges:"
+      kubectl -n "$ns" get challenges.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o wide || true
+      echo ">>> Tail cert-manager controller logs:"
+      kubectl -n cert-manager logs -l app=cert-manager --tail=200 || true
+      return 1
+    fi
+    sleep 5
+  done
+}
+
+# --- Certificate reuse helpers ---
+
+_strip_k8s_metadata_json() {
+  jq 'del(.metadata.creationTimestamp,.metadata.resourceVersion,.metadata.uid,.metadata.selfLink,.metadata.generation,.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",.metadata.managedFields,.metadata.ownerReferences,.metadata.namespace)'
+}
+
+backup_cert_artifacts() {
+  mkdir -p manifests/backup
+  echo ">>> Backing up TLS secret istio-system/dev-wildcard-tls and ACME account secret cert-manager/letsencrypt-prod (if present)..."
+  if kubectl -n istio-system get secret dev-wildcard-tls >/dev/null 2>&1; then
+    kubectl -n istio-system get secret dev-wildcard-tls -o json | _strip_k8s_metadata_json > manifests/backup/istio-system.dev-wildcard-tls.json || true
+  fi
+  if kubectl -n cert-manager get secret letsencrypt-prod >/dev/null 2>&1; then
+    kubectl -n cert-manager get secret letsencrypt-prod -o json | _strip_k8s_metadata_json > manifests/backup/cert-manager.letsencrypt-prod.json || true
+  fi
+}
+
+restore_cert_artifacts() {
+  local restored=0
+  if [ -f manifests/backup/cert-manager.letsencrypt-prod.json ]; then
+    echo ">>> Restoring ACME account secret (cert-manager/letsencrypt-prod) from backup..."
+    kubectl apply -f manifests/backup/cert-manager.letsencrypt-prod.json && restored=1 || true
+  fi
+  if [ -f manifests/backup/istio-system.dev-wildcard-tls.json ]; then
+    echo ">>> Restoring TLS secret (istio-system/dev-wildcard-tls) from backup..."
+    kubectl apply -f manifests/backup/istio-system.dev-wildcard-tls.json && restored=1 || true
+  fi
+  return $restored
+}
+
+cert_days_remaining() {
+  # Prints integer days remaining until expiration, or 0 if unavailable
+  local ns="$1"; shift
+  local name="$1"; shift
+  local tmp=$(mktemp)
+  if ! kubectl -n "$ns" get secret "$name" -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d > "$tmp"; then
+    rm -f "$tmp"; echo 0; return
+  fi
+  local not_after
+  not_after=$(openssl x509 -enddate -noout -in "$tmp" 2>/dev/null | cut -d= -f2-)
+  rm -f "$tmp"
+  if [ -z "$not_after" ]; then echo 0; return; fi
+  local exp_ts now_ts days
+  exp_ts=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
+  now_ts=$(date +%s)
+  if [ "$exp_ts" -le 0 ]; then echo 0; return; fi
+  days=$(( (exp_ts - now_ts) / 86400 ))
+  [ $days -lt 0 ] && days=0
+  echo $days
+}
+
+# Returns 0 if the certificate is expired or missing, 1 if still valid
+cert_is_expired() {
+  local ns="$1"; shift
+  local name="$1"; shift
+  local tmp=$(mktemp)
+  if ! kubectl -n "$ns" get secret "$name" -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d > "$tmp"; then
+    rm -f "$tmp"; return 0
+  fi
+  # openssl -checkend 0 returns 0 if the cert will be valid for at least 0 more seconds (i.e., not expired)
+  if openssl x509 -checkend 0 -noout -in "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"; return 1
+  else
+    rm -f "$tmp"; return 0
+  fi
+}
+
 # --- Configuration Management ---
 
 configure_cloudflare() {
@@ -167,14 +355,13 @@ configure_cloudflare() {
 
   if [ -n "$default_email" ]; then
     read -p "Enter your Cloudflare email address [$default_email]: " cf_email || true
-  else
     read -p "Enter your Cloudflare email address: " cf_email || true
   fi
   cf_email=${cf_email:-$default_email}
 
   if [ -n "$default_token" ]; then
     read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required) [***hidden***]: " cf_token || true
-  else
+  # removed legacy sed branch
     read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required): " cf_token || true
   fi
   echo
@@ -343,6 +530,40 @@ check_node_pressure() {
     NODE_MEM_PRESSURE="true"
     echo "WARNING: One or more nodes report MemoryPressure. Components may fail to schedule."
   fi
+}
+
+# Lightweight readiness gate for heavy components
+wait_for_pods_ready() {
+  local ns="$1"; shift
+  local selector="$1"; shift
+  local min_ready="$1"; shift
+  local timeout_secs="$1"; shift
+  local label_arg=()
+  if [ -n "$selector" ]; then
+    label_arg=(-l "$selector")
+  fi
+  echo ">>> Waiting for at least ${min_ready} Ready pod(s) in ns='${ns}' selector='${selector}' (timeout ${timeout_secs}s)"
+  local start_ts=$(date +%s)
+  while true; do
+    local pods_json
+    pods_json=$(kubectl -n "$ns" get pods "${label_arg[@]}" -o json 2>/dev/null || echo '{}')
+    local ready
+    ready=$(echo "$pods_json" | jq '[.items[]? | select(.status.phase=="Running") | select( (.status.containerStatuses // []) | all(.ready==true) ) ] | length')
+    if [ "${ready:-0}" -ge "$min_ready" ]; then
+      echo ">>> ${ns} has ${ready} Ready pod(s) for selector '${selector}'."
+      return 0
+    fi
+    local now=$(date +%s)
+    if [ $((now-start_ts)) -ge "$timeout_secs" ]; then
+      echo "ERROR: Not enough Ready pods in ${ns} for selector '${selector}' after ${timeout_secs}s (need ${min_ready}, have ${ready:-0})."
+      echo ">>> Pods snapshot:"
+      kubectl -n "$ns" get pods "${label_arg[@]}" -o wide || true
+      echo ">>> Recent events:"
+      kubectl -n "$ns" get events --sort-by=.lastTimestamp | tail -n 50 || true
+      exit 1
+    fi
+    sleep 5
+  done
 }
 
 # --- Teardown Cleanup Helpers ---
@@ -682,8 +903,80 @@ reclaimPolicy: Delete
 EOF
 
   echo ">>> Installing cert-manager..."
-  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml
+  CERT_MANAGER_URL="https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml"
+  : <<'LEGACY_SED'
+  # removed: legacy sed-based patch of cert-manager manifest
+  # removed: old sed args injection
+  # removed
+  sed '/name: cert-manager-controller/,$!b;/args:/a\        - --dns01-recursive-nameservers-only\
+        - --dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53
+' | kubectl apply -f -
   kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
+LEGACY_SED
+  # Apply upstream manifest as-is to avoid YAML injection pitfalls
+  kubectl apply -f "$CERT_MANAGER_URL"
+  # Ensure webhook is up before patching controller args
+  kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager || true
+  # Safety net: ensure cert-manager controller has Leases RBAC in its namespace for leader election
+  # Some environments lack these Role/RoleBinding after customizations; this manifest is idempotent
+  kubectl apply -f manifests/cert-manager-leader-rbac.yaml || true
+  # Ensure critical default args are present on the controller (avoids stale misconfig from prior runs)
+  echo ">>> Verifying cert-manager controller default args..."
+  for i in $(seq 1 60); do
+    kubectl -n cert-manager get deploy cert-manager >/dev/null 2>&1 && break
+    sleep 2
+  done
+  # Make sure args array exists
+  if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0] | has("args")' >/dev/null 2>&1; then
+    kubectl -n cert-manager patch deployment cert-manager --type=json \
+      -p '[{"op":"add","path":"/spec/template/spec/containers/0/args","value":[]}]' || true
+  fi
+  # Append leader/namespace defaults if missing
+  if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--leader-election-namespace=$(POD_NAMESPACE)")' >/dev/null 2>&1; then
+    kubectl -n cert-manager patch deployment cert-manager --type=json \
+      -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--leader-election-namespace=$(POD_NAMESPACE)"}]' || true
+  fi
+  if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--cluster-resource-namespace=$(POD_NAMESPACE)")' >/dev/null 2>&1; then
+    kubectl -n cert-manager patch deployment cert-manager --type=json \
+      -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--cluster-resource-namespace=$(POD_NAMESPACE)"}]' || true
+  fi
+  # Show args and restart to pick up patches
+  echo ">>> cert-manager controller args:"
+  kubectl -n cert-manager get deploy cert-manager -o jsonpath='{.spec.template.spec.containers[0].args}' || true
+  echo
+  kubectl -n cert-manager rollout restart deploy/cert-manager || true
+  kubectl -n cert-manager rollout status deploy/cert-manager --timeout=300s || true
+  if [ "${USE_DNS_PUBLIC_RESOLVERS:-false}" = "true" ]; then
+    echo ">>> Enabling cert-manager public DNS resolvers (idempotent append)..."
+    # Wait for the cert-manager deployment object to be created
+    for i in $(seq 1 60); do
+      if kubectl -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
+        break
+      fi
+      sleep 2
+    done
+    # Ensure the args array exists to safely append values later
+    if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0] | has("args")' >/dev/null 2>&1; then
+      kubectl -n cert-manager patch deployment cert-manager --type=json \
+        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args","value":[]}]' || true
+    fi
+    # Append flags only if they are not already present
+    if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--dns01-recursive-nameservers-only")' >/dev/null 2>&1; then
+      kubectl -n cert-manager patch deployment cert-manager --type=json \
+        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--dns01-recursive-nameservers-only"}]' || true
+    fi
+    if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53")' >/dev/null 2>&1; then
+      kubectl -n cert-manager patch deployment cert-manager --type=json \
+        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53"}]' || true
+    fi
+    # Show effective args for verification
+    echo ">>> cert-manager controller args:"
+    kubectl -n cert-manager get deploy cert-manager -o jsonpath='{.spec.template.spec.containers[0].args}' || true
+    echo
+  else
+    echo ">>> Skipping cert-manager DNS resolver flags (USE_DNS_PUBLIC_RESOLVERS=false)"
+  fi
+  # removed stray fi from legacy block
 
   echo ">>> Configuring SSL certificates with Let's Encrypt and Cloudflare..."
   if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_EMAIL:-}" ] || [ -z "${CLOUDFLARE_ZONE_ID:-}" ]; then
@@ -717,7 +1010,7 @@ EOF
           echo "WARNING: Continuing without SSL setup"
         fi
       else
-        echo ">>> Applying ClusterIssuer manifest..."
+          echo ">>> Applying ClusterIssuer manifest..."
         # Create temporary file to debug YAML structure
         TEMP_MANIFEST=$(mktemp)
         cat > "$TEMP_MANIFEST" <<EOF
@@ -769,10 +1062,18 @@ EOF
             echo "WARNING: Continuing without SSL setup"
           fi
         else
-          # Wait for ClusterIssuer to be ready
-          echo "Waiting for ClusterIssuer to be ready..."
-          if ! kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=300s; then
-            echo "ERROR: ClusterIssuer did not become ready within 5 minutes"
+          # Wait for the issuer that will be used (staging if USE_STAGING_SSL=true, else prod)
+          local WAIT_ISSUER_NAME="letsencrypt-prod"
+          if [ "$USE_STAGING_SSL" = "true" ]; then
+            WAIT_ISSUER_NAME="letsencrypt-staging"
+          fi
+          echo "Waiting for ClusterIssuer '${WAIT_ISSUER_NAME}' to be ready..."
+          if ! kubectl wait --for=condition=Ready clusterissuer/${WAIT_ISSUER_NAME} --timeout=300s; then
+            echo "ERROR: ClusterIssuer '${WAIT_ISSUER_NAME}' did not become ready within 5 minutes"
+            echo ">>> Describe '${WAIT_ISSUER_NAME}':"
+            kubectl describe clusterissuer ${WAIT_ISSUER_NAME} || true
+            echo ">>> cert-manager controller logs (last 200 lines):"
+            kubectl -n cert-manager logs deploy/cert-manager --tail=200 || true
             if [ "$REQUIRE_SSL" = "true" ]; then
               cleanup_failed_ssl_setup
               exit 1
@@ -780,49 +1081,47 @@ EOF
               echo "WARNING: SSL setup may not work properly. Continuing anyway."
             fi
           else
-            echo "Cloudflare ClusterIssuer configured successfully. Wildcard certificate will be applied after Istio installation."
+            echo "Cloudflare ClusterIssuer '${WAIT_ISSUER_NAME}' is Ready. Wildcard certificate will be applied after Istio installation."
           fi
         fi
       fi
     fi
   fi
 
-  echo ">>> Skipping MinIO installation (temporarily disabled for debugging)"
-  # echo ">>> Installing MinIO (single instance)..."
-  # kubectl create ns minio || true
-  # helm repo add minio https://charts.min.io/
-  # helm upgrade --install minio minio/minio -n minio \
-  #   --set mode=standalone \
-  #   --set replicas=1 \
-  #   --set auth.rootUser=${MINIO_ACCESS_KEY} \
-  #   --set auth.rootPassword=${MINIO_SECRET_KEY} \
-  #   --set defaultBuckets="velero" \
-  #   --set persistence.enabled=true \
-  #   --set persistence.size=5Gi \
-  #   --set resources.requests.memory=512Mi \
-  #   --set resources.requests.cpu=250m
-  # kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio
-  # kubectl wait --for=condition=ready --timeout=300s pod -l app=minio -n minio
+  echo ">>> Installing MinIO (single instance)..."
+  kubectl create ns minio || true
+  helm repo add minio https://charts.min.io/ || true
+  helm upgrade --install minio minio/minio -n minio \
+    --set mode=standalone \
+    --set replicas=1 \
+    --set auth.rootUser=${MINIO_ACCESS_KEY} \
+    --set auth.rootPassword=${MINIO_SECRET_KEY} \
+    --set defaultBuckets="velero" \
+    --set persistence.enabled=true \
+    --set persistence.size=5Gi \
+    --set resources.requests.memory=512Mi \
+    --set resources.requests.cpu=250m
+  kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio || true
+  kubectl wait --for=condition=ready --timeout=300s pod -l app=minio -n minio || true
 
-  echo ">>> Skipping Velero installation (disabled due to MinIO dependency)"
-  # echo ">>> Installing Velero..."
-  # # Ensure MinIO credentials file exists for Velero's AWS plugin
-  # mkdir -p ./manifests
-  # if [ ! -f ./manifests/minio-credentials ]; then
-  #   cat > ./manifests/minio-credentials <<EOF
-  # [default]
-  # aws_access_key_id = ${MINIO_ACCESS_KEY}
-  # aws_secret_access_key = ${MINIO_SECRET_KEY}
-  # EOF
-  #   chmod 600 ./manifests/minio-credentials || true
-  # fi
-  # velero install \
-  #   --provider aws \
-  #   --plugins velero/velero-plugin-for-aws:v1.8.0 \
-  #   --bucket velero \
-  #   --secret-file ./manifests/minio-credentials \
-  #   --use-volume-snapshots=false \
-  #   --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000
+  echo ">>> Installing Velero..."
+  # Ensure MinIO credentials file exists for Velero's AWS plugin
+  mkdir -p ./manifests
+  if [ ! -f ./manifests/minio-credentials ]; then
+    cat > ./manifests/minio-credentials <<EOF
+[default]
+aws_access_key_id = ${MINIO_ACCESS_KEY}
+aws_secret_access_key = ${MINIO_SECRET_KEY}
+EOF
+    chmod 600 ./manifests/minio-credentials || true
+  fi
+  velero install \
+    --provider aws \
+    --plugins velero/velero-plugin-for-aws:v1.8.0 \
+    --bucket velero \
+    --secret-file ./manifests/minio-credentials \
+    --use-volume-snapshots=false \
+    --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000 || true
 
   echo ">>> Prechecking Istio..."
   istioctl x precheck || true
@@ -872,92 +1171,181 @@ EOF
   echo ">>> Configuring Istio Gateway for SSL termination..."
   kubectl apply -f manifests/istio-gateway.yaml
 
-  # Apply wildcard certificate now that istio-system namespace exists
+  # Apply or reuse wildcard certificate now that istio-system namespace exists
   if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL" ]; then
-    echo ">>> Requesting wildcard SSL certificate..."
-    kubectl apply -f manifests/wildcard-certificate.yaml
-    echo "Wildcard certificate requested. It may take a few minutes to be issued."
-    echo "Check status with: kubectl get certificate -n istio-system"
+    local reuse_ok="false"
+    if [ "$REUSE_EXISTING_CERTS" = "true" ]; then
+      # Try to restore backups and check validity
+      restore_cert_artifacts || true
+      local days_left
+      days_left=$(cert_days_remaining istio-system dev-wildcard-tls)
+      # Prefer reuse unless the cert is actually expired; MIN_CERT_VALID_DAYS > 0 enables optional early rotation
+      if cert_is_expired istio-system dev-wildcard-tls; then
+        echo ">>> Existing TLS secret is expired (or missing). Proceeding to (re)issue."
+      else
+        if [ "$MIN_CERT_VALID_DAYS" -gt 0 ] && [ "${days_left:-0}" -lt "$MIN_CERT_VALID_DAYS" ]; then
+          echo ">>> TLS secret is valid but below early-rotation threshold (${days_left}d < ${MIN_CERT_VALID_DAYS}d). Proceeding to renew."
+        else
+          echo ">>> Reusing existing TLS secret (istio-system/dev-wildcard-tls), ${days_left} day(s) remaining. Skipping issuance."
+          reuse_ok="true"
+        fi
+      fi
+    fi
+
+    if [ "$reuse_ok" != "true" ]; then
+      # Decide issuer (prod vs staging) for the Certificate
+      local SSL_ISSUER_NAME="letsencrypt-prod"
+      if [ "$USE_STAGING_SSL" = "true" ]; then
+        SSL_ISSUER_NAME="letsencrypt-staging"
+      fi
+      if [ "$FLUSH_COREDNS_ON_ISSUANCE" = "true" ]; then
+        echo ">>> Flushing CoreDNS cache (rollout restart) to avoid negative caching..."
+        kubectl -n kube-system rollout restart deploy coredns || true
+        kubectl -n kube-system rollout status deploy/coredns --timeout=120s || true
+      fi
+      if [ "$CLEANUP_ACME_DNS" = "true" ]; then
+        cleanup_acme_dns_records || true
+      fi
+      echo ">>> Requesting wildcard SSL certificate via '${SSL_ISSUER_NAME}' (SANs: *.${K3S_INGRESS_DOMAIN}, ${K3S_INGRESS_DOMAIN})..."
+      TMP_CERT_MANIFEST=$(mktemp)
+      cat > "$TMP_CERT_MANIFEST" <<EOF
+apiVersion: cert-manager.io/v1
+kind: Certificate
+metadata:
+  name: dev-wildcard-cert
+  namespace: istio-system
+spec:
+  secretName: dev-wildcard-tls
+  privateKey:
+    rotationPolicy: Never
+  issuerRef:
+    name: ${SSL_ISSUER_NAME}
+    kind: ClusterIssuer
+  commonName: "*.${K3S_INGRESS_DOMAIN}"
+  dnsNames:
+  - "*.${K3S_INGRESS_DOMAIN}"
+  - "${K3S_INGRESS_DOMAIN}"
+EOF
+      kubectl apply -f "$TMP_CERT_MANIFEST"
+      rm -f "$TMP_CERT_MANIFEST"
+      echo "Wildcard certificate requested. It may take a few minutes to be issued."
+      echo "Check status with: kubectl get certificate -n istio-system"
+      if [ "$WAIT_FOR_CERT_READY" = "true" ]; then
+        wait_for_certificate_ready "istio-system" "dev-wildcard-cert" 600
+      fi
+      # Backup artifacts after successful issuance or even if Ready wait is disabled
+      backup_cert_artifacts || true
+    fi
   fi
 
-  echo ">>> Skipping Keycloak installation (temporarily disabled for debugging)"
-  # echo ">>> Installing Keycloak..."
-  # helm repo add codecentric https://codecentric.github.io/helm-charts
-  # helm upgrade --install keycloak codecentric/keycloakx -n keycloak --create-namespace \
-  #   --set replicas=1 \
-  #   --set ingress.enabled=true \
-  #   --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
-  #   --set ingress.hosts[0].paths[0].path=/ \
-  #   --set args='{start-dev}'
+  echo ">>> Installing Keycloak..."
+  # Ensure namespace exists before applying resources into it
+  kubectl create namespace keycloak || true
+  helm repo add codecentric https://codecentric.github.io/helm-charts || true
+  # Use 'env' list instead of 'extraEnv' to satisfy chart schema
+  helm upgrade --install keycloak codecentric/keycloakx -n keycloak \
+    --set replicas=1 \
+    --set ingress.enabled=true \
+    --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
+    --set ingress.hosts[0].paths[0].path=/ \
+    --set args='{start-dev}' \
+    --set env[0].name=KEYCLOAK_ADMIN --set env[0].value=admin \
+    --set env[1].name=KEYCLOAK_ADMIN_PASSWORD --set env[1].value=admin \
+    --set env[2].name=KC_HEALTH_ENABLED --set env[2].value=true
 
-  # echo ">>> Applying Keycloak VirtualService..."
-  # kubectl apply -f manifests/keycloak-virtualservice.yaml
+  echo ">>> Applying Keycloak VirtualService..."
+  kubectl apply -f manifests/keycloak-virtualservice.yaml || true
+  echo ">>> Adjusting Keycloak health probes for Quarkus distribution..."
+  # Patch the Keycloak StatefulSet probes to use modern endpoints and port 8080
+  for i in $(seq 1 60); do
+    if kubectl -n keycloak get statefulset keycloak-keycloakx >/dev/null 2>&1; then
+      break
+    fi
+    sleep 2
+  done
+  TMP_KC_PATCH=$(mktemp)
+  cat > "$TMP_KC_PATCH" <<'JSON'
+[
+  {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/httpGet/path","value":"/health/ready"},
+  {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/httpGet/port","value":8080},
+  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/health/ready"},
+  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/port","value":8080},
+  {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/path","value":"/health/live"},
+  {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/port","value":8080}
+]
+JSON
+  kubectl -n keycloak patch statefulset keycloak-keycloakx --type=json -p "$(cat "$TMP_KC_PATCH")" || true
+  rm -f "$TMP_KC_PATCH" || true
+  kubectl -n keycloak rollout restart statefulset/keycloak-keycloakx || true
+  # Readiness gate: Keycloak
+  wait_for_pods_ready keycloak "app.kubernetes.io/instance=keycloak" 1 420
 
-  echo ">>> Skipping Vault installation (temporarily disabled for debugging)"
-  # echo ">>> Installing Vault..."
-  # helm repo add hashicorp https://helm.releases.hashicorp.com
-  # helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
-  #   --set server.dev.enabled=true
+  echo ">>> Installing Vault..."
+  helm repo add hashicorp https://helm.releases.hashicorp.com || true
+  helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
+    --set server.dev.enabled=true || true
 
-  echo ">>> Skipping ELK installation (temporarily disabled for debugging)"
-  # echo ">>> Installing ELK (minimal, tuned for k3d)..."
-  # helm repo add elastic https://helm.elastic.co
-  # check_node_pressure
-  # ELASTIC_TOLERATIONS_ARGS=()
-  # if [ "${NODE_DISK_PRESSURE}" = "true" ] && [ "${ALLOW_TAINTED_NODES:-}" = "true" ]; then
-  #   echo ">>> Allowing scheduling on DiskPressure nodes for Elasticsearch (override)."
-  #   ELASTIC_TOLERATIONS_ARGS+=(
-  #     --set tolerations[0].key=node.kubernetes.io/disk-pressure \
-  #     --set tolerations[0].operator=Exists \
-  #     --set tolerations[0].effect=NoSchedule
-  #   )
-  # fi
-  # helm upgrade --install elasticsearch elastic/elasticsearch -n elk --create-namespace \
-  #   --set replicas=1 \
-  #   --set resources.requests.cpu=200m \
-  #   --set resources.requests.memory=512Mi \
-  #   --set resources.limits.memory=1Gi \
-  #   --set esJavaOpts="-Xms512m -Xmx512m" \
-  #   --set persistence.enabled=false \
-  #   ${ELASTIC_TOLERATIONS_ARGS[@]} \
-  #   --wait --timeout 10m
-  # helm upgrade --install kibana elastic/kibana -n elk \
-  #   --set replicas=1 \
-  #   --set resources.requests.cpu=100m \
-  #   --set resources.requests.memory=256Mi \
-  #   --wait --timeout 10m
+  echo ">>> Installing ELK (minimal, tuned for k3d)..."
+  helm repo add elastic https://helm.elastic.co || true
+  check_node_pressure
+  ELASTIC_TOLERATIONS_ARGS=()
+  if [ "${NODE_DISK_PRESSURE}" = "true" ] && [ "${ALLOW_TAINTED_NODES:-}" = "true" ]; then
+    echo ">>> Allowing scheduling on DiskPressure nodes for Elasticsearch (override)."
+    ELASTIC_TOLERATIONS_ARGS+=(
+      --set tolerations[0].key=node.kubernetes.io/disk-pressure \
+      --set tolerations[0].operator=Exists \
+      --set tolerations[0].effect=NoSchedule
+    )
+  fi
+  helm upgrade --install elasticsearch elastic/elasticsearch -n elk --create-namespace \
+    --set replicas=1 \
+    --set resources.requests.cpu=200m \
+    --set resources.requests.memory=512Mi \
+    --set resources.limits.memory=1Gi \
+    --set esJavaOpts="-Xms512m -Xmx512m" \
+    --set persistence.enabled=false \
+    ${ELASTIC_TOLERATIONS_ARGS[@]} \
+    --wait --timeout 10m || true
+  helm upgrade --install kibana elastic/kibana -n elk \
+    --set replicas=1 \
+    --set resources.requests.cpu=100m \
+    --set resources.requests.memory=256Mi \
+    --wait --timeout 10m || true
 
-  # echo ">>> Waiting for ELK pods to become Ready..."
-  # kubectl -n elk wait --for=condition=ready pod --all --timeout=600s || true
+  echo ">>> Waiting for ELK pods to become Ready..."
+  # Readiness gates: Elasticsearch and Kibana
+  wait_for_pods_ready elk "app.kubernetes.io/name=elasticsearch,app.kubernetes.io/instance=elasticsearch" 1 600
+  wait_for_pods_ready elk "app.kubernetes.io/name=kibana,app.kubernetes.io/instance=kibana" 1 600
 
-  # echo ">>> Installing Fluent Bit..."
-  # helm repo add fluent https://fluent.github.io/helm-charts
-  # helm upgrade --install fluent-bit fluent/fluent-bit -n logging --create-namespace \
-  #   --set backend.type=es \
-  #   --set backend.es.host=elasticsearch-master.elk.svc.cluster.local
+  echo ">>> Installing Fluent Bit..."
+  helm repo add fluent https://fluent.github.io/helm-charts || true
+  helm upgrade --install fluent-bit fluent/fluent-bit -n logging --create-namespace \
+    --set backend.type=es \
+    --set backend.es.host=elasticsearch-master.elk.svc.cluster.local || true
 
-  echo ">>> Skipping Prometheus Operator installation (temporarily disabled for debugging)"
-  # echo ">>> Installing Prometheus Operator (minimal)..."
-  # helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
-  # helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
-  #   --set prometheus.prometheusSpec.replicas=1 \
-  #   --set prometheus.prometheusSpec.resources.requests.cpu=250m \
-  #   --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
-  #   --set prometheus.prometheusSpec.retention=7d \
-  #   --set alertmanager.alertmanagerSpec.replicas=1 \
-  #   --set alertmanager.alertmanagerSpec.resources.requests.cpu=100m \
-  #   --set alertmanager.alertmanagerSpec.resources.requests.memory=128Mi \
-  #   --set grafana.replicas=1 \
-  #   --set grafana.resources.requests.cpu=100m \
-  #   --set grafana.resources.requests.memory=128Mi
+  echo ">>> Installing Prometheus Operator (minimal)..."
+  helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
+  helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
+    --set prometheus.prometheusSpec.replicas=1 \
+    --set prometheus.prometheusSpec.resources.requests.cpu=250m \
+    --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
+    --set prometheus.prometheusSpec.retention=7d \
+    --set alertmanager.alertmanagerSpec.replicas=1 \
+    --set alertmanager.alertmanagerSpec.resources.requests.cpu=100m \
+    --set alertmanager.alertmanagerSpec.resources.requests.memory=128Mi \
+    --set grafana.replicas=1 \
+    --set grafana.resources.requests.cpu=100m \
+    --set grafana.resources.requests.memory=128Mi || true
+  # Readiness gates: Grafana and Prometheus
+  wait_for_pods_ready monitoring "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=kube-prometheus-stack" 1 600
+  wait_for_pods_ready monitoring "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=kube-prometheus-stack" 1 600
 
-  echo ">>> Skipping compliance manifests (temporarily disabled for debugging)"
-  # echo ">>> Applying compliance manifests..."
-  # kubectl apply -f manifests/compliance-system.yaml
-  # kubectl apply -f manifests/compliance-test.yaml
+  echo ">>> Applying compliance manifests..."
+  kubectl apply -f manifests/compliance-system.yaml || true
+  kubectl apply -f manifests/compliance-test.yaml || true
 
-  echo ">>> Skipping Rancher cluster registration (temporarily disabled for debugging)"
-  # register_cluster
+  echo ">>> Registering cluster with Rancher..."
+  register_cluster
 
   echo ">>> Cluster ready!"
   echo
