@@ -25,6 +25,7 @@ spec:
     solvers:
     - dns01:
         cloudflare:
+          email: fadzi@butterflycluster.net
           apiTokenSecretRef:
             name: cloudflare-api-token-secret
             key: api-token
@@ -46,6 +47,7 @@ spec:
     solvers:
     - dns01:
         cloudflare:
+          email: fadzi@butterflycluster.net
           apiTokenSecretRef:
             name: cloudflare-api-token-secret
             key: api-token

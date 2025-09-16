@@ -128,13 +128,22 @@ configure_cloudflare() {
   echo
   cf_token=${cf_token:-$default_token}
 
-  if [ -z "$cf_email" ] || [ -z "$cf_token" ]; then
-    echo "Cloudflare email and API token cannot be empty."
+  local default_zone_id="${CLOUDFLARE_ZONE_ID:-}"
+  if [ -n "$default_zone_id" ]; then
+    read -p "Enter your Cloudflare Zone ID [$default_zone_id]: " cf_zone_id || true
+  else
+    read -p "Enter your Cloudflare Zone ID: " cf_zone_id || true
+  fi
+  cf_zone_id=${cf_zone_id:-$default_zone_id}
+
+  if [ -z "$cf_email" ] || [ -z "$cf_token" ] || [ -z "$cf_zone_id" ]; then
+    echo "Cloudflare email, API token, and Zone ID cannot be empty."
     return 1
   fi
 
   CLOUDFLARE_EMAIL="$cf_email"
   CLOUDFLARE_API_TOKEN="$cf_token"
+  CLOUDFLARE_ZONE_ID="$cf_zone_id"
 
   echo "Cloudflare configuration set successfully."
 }
@@ -190,6 +199,7 @@ export CA_FILE="/etc/ssl/butterflycluster_com.ca-bundle"
 # Cloudflare Configuration (for Let's Encrypt DNS-01 challenges)
 export CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
 export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
+export CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID}"
 EOL
       echo "Configuration saved successfully to rancher.env."
       return
@@ -262,6 +272,7 @@ export CA_FILE="/etc/ssl/butterflycluster_com.ca-bundle"
 # Cloudflare Configuration (for Let's Encrypt DNS-01 challenges)
 export CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
 export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
+export CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID}"
 EOL
   echo "Configuration saved successfully to rancher.env."
 }
@@ -495,6 +506,21 @@ register_cluster() {
   rm -f "$TMPRESP"
   echo "Cluster object created with ID: ${CLUSTER_ID}"
 
+  echo "Waiting for cluster object to be ready in Rancher..."
+  for i in $(seq 1 12); do
+    CLUSTER_STATE=$(curl -s -k -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" "${RANCHER_URL}/v3/clusters/${CLUSTER_ID}" | jq -r '.state // empty')
+    if [ "$CLUSTER_STATE" != "provisioning" ] && [ -n "$CLUSTER_STATE" ]; then
+      echo "Cluster state is now '${CLUSTER_STATE}'. Proceeding."
+      break
+    fi
+    if [ $i -eq 12 ]; then
+       echo "ERROR: Cluster '${CLUSTER_NAME}' did not become ready in Rancher after 60s."
+       exit 1
+    fi
+    echo "Waiting for cluster to finish provisioning... (${i}/12)"
+    sleep 5
+  done
+
   echo "Generating registration token..."
   # Create a token resource, then poll until manifestUrl is populated
   TMP_TOKEN_RESP=$(mktemp)
@@ -578,7 +604,7 @@ deregister_cluster() {
 
 create_cluster() {
   echo ">>> Creating k3d cluster: $CLUSTER_NAME"
-  k3d cluster create "$CLUSTER_NAME" --agents 1 --wait
+  k3d cluster create "$CLUSTER_NAME" --agents 1 --port '80:80@loadbalancer' --port '443:443@loadbalancer' --k3s-arg "--disable=traefik@server:0" --wait
   export KUBECONFIG=$(k3d kubeconfig write "$CLUSTER_NAME")
 
   echo ">>> Installing OpenEBS LocalPV Hostpath..."
@@ -608,14 +634,55 @@ EOF
   kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
 
   echo ">>> Configuring SSL certificates with Let's Encrypt and Cloudflare..."
-  if [ -z "$CLOUDFLARE_API_TOKEN" ] || [ -z "$CLOUDFLARE_EMAIL" ]; then
-    echo "WARNING: Cloudflare credentials not configured. SSL certificates will not be automatically issued."
+  if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_EMAIL:-}" ] || [ -z "${CLOUDFLARE_ZONE_ID:-}" ]; then
+    echo "WARNING: Cloudflare credentials (API Token, Email, Zone ID) not configured. SSL certificates will not be automatically issued."
     echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
   else
-    # Update the Cloudflare issuer manifest with actual credentials
-    sed -e "s/api-token: \"\"/api-token: \"${CLOUDFLARE_API_TOKEN}\"/" \
-        -e "s/email: \"\"/email: \"${CLOUDFLARE_EMAIL}\"/" \
-        manifests/cloudflare-issuer.yaml | kubectl apply -f -
+    echo ">>> Creating Cloudflare credentials secret..."
+    kubectl create secret generic cloudflare-api-token-secret -n cert-manager \
+      --from-literal=api-token="${CLOUDFLARE_API_TOKEN}" --dry-run=client -o yaml | kubectl apply -f -
+
+    echo ">>> Applying ClusterIssuer manifest..."
+    cat <<EOF | kubectl apply -f -
+---
+apiVersion: cert-manager.io/v1
+sedkind: ClusterIssuer
+metadata:
+  name: letsencrypt-staging
+spec:
+  acme:
+    server: https://acme-staging-v02.api.letsencrypt.org/directory
+    email: "${CLOUDFLARE_EMAIL}"
+    privateKeySecretRef:
+      name: letsencrypt-staging
+    solvers:
+    - dns01:
+        cloudflare:
+          email: "${CLOUDFLARE_EMAIL}"
+          zoneID: "${CLOUDFLARE_ZONE_ID}"
+          apiTokenSecretRef:
+            name: cloudflare-api-token-secret
+            key: api-token
+---
+apiVersion: cert-manager.io/v1
+kind: ClusterIssuer
+metadata:
+  name: letsencrypt-prod
+spec:
+  acme:
+    server: https://acme-v02.api.letsencrypt.org/directory
+    email: "${CLOUDFLARE_EMAIL}"
+    privateKeySecretRef:
+      name: letsencrypt-prod
+    solvers:
+    - dns01:
+        cloudflare:
+          email: "${CLOUDFLARE_EMAIL}"
+          zoneID: "${CLOUDFLARE_ZONE_ID}"
+          apiTokenSecretRef:
+            name: cloudflare-api-token-secret
+            key: api-token
+EOF
 
     # Wait for ClusterIssuer to be ready
     echo "Waiting for ClusterIssuer to be ready..."
@@ -721,7 +788,11 @@ EOF
     --set replicas=1 \
     --set ingress.enabled=true \
     --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
-    --set ingress.hosts[0].paths[0].path=/
+    --set ingress.hosts[0].paths[0].path=/ \
+    --set args='{start-dev}'
+
+  echo ">>> Applying Keycloak VirtualService..."
+  kubectl apply -f manifests/keycloak-virtualservice.yaml
 
   echo ">>> Installing Vault..."
   helm repo add hashicorp https://helm.releases.hashicorp.com
@@ -841,7 +912,8 @@ case "${1:-}" in
   rancher-up) rancher_up ;; 
   rancher-down) rancher_down ;; 
   rancher-reset) rancher_reset ;; 
-  configure) configure_all ;; 
+  configure) configure_all ;;
+  configure-cloudflare) configure_cloudflare ;; 
   cleanup) cleanup ;;
   *) 
     echo "Usage: $0 {up|down|reset|rancher-up|rancher-down|rancher-reset|configure|cleanup}"
