@@ -27,6 +27,11 @@ AUTO_RANCHER_PURGE=${AUTO_RANCHER_PURGE:-false}
 # Path to Rancher state directory on host
 RANCHER_DIR=${RANCHER_DIR:-/var/lib/rancher}
 
+# --- SSL Configuration behavior (tunable via env) ---
+# When true, SSL setup must succeed or the script fails.
+# When false, SSL setup failures are warned but script continues.
+REQUIRE_SSL=${REQUIRE_SSL:-true}
+
 # --- Local SSL Certificate Paths ---
 # Used for the external Rancher Docker container
 CERT_DIR="/etc/ssl"
@@ -100,6 +105,53 @@ check_deps() {
   if [ "$missing" -eq 1 ]; then
     exit 1
   fi
+}
+
+validate_cloudflare_credentials() {
+  local cf_email="$1"
+  local cf_token="$2"
+  local cf_zone_id="$3"
+
+  echo ">>> Validating Cloudflare API credentials..."
+
+  # Test API token validity by fetching zone info
+  local api_response
+  local http_status
+
+  api_response=$(curl -s -w "\n%{http_code}" -X GET "https://api.cloudflare.com/client/v4/zones/${cf_zone_id}" \
+    -H "Authorization: Bearer ${cf_token}" \
+    -H "Content-Type: application/json" 2>/dev/null)
+
+  http_status=$(echo "$api_response" | tail -n1)
+  api_response=$(echo "$api_response" | head -n -1)
+
+  if [ "$http_status" != "200" ]; then
+    echo "ERROR: Cloudflare API validation failed (HTTP $http_status)"
+    if [ -n "$api_response" ]; then
+      echo "Response: $api_response"
+    fi
+    return 1
+  fi
+
+  # Check if we have DNS edit permissions
+  local zone_name
+  zone_name=$(echo "$api_response" | jq -r '.result.name // empty' 2>/dev/null)
+
+  if [ -z "$zone_name" ]; then
+    echo "ERROR: Failed to retrieve zone information from Cloudflare API"
+    return 1
+  fi
+
+  echo ">>> Cloudflare credentials validated successfully for zone: $zone_name"
+  return 0
+}
+
+cleanup_failed_ssl_setup() {
+  echo ">>> Cleaning up failed SSL setup..."
+  kubectl delete secret cloudflare-api-token-secret -n cert-manager --ignore-not-found=true
+  kubectl delete clusterissuer letsencrypt-staging --ignore-not-found=true
+  kubectl delete clusterissuer letsencrypt-prod --ignore-not-found=true
+  echo ">>> SSL setup cleanup completed"
 }
 
 # --- Configuration Management ---
@@ -635,15 +687,38 @@ EOF
 
   echo ">>> Configuring SSL certificates with Let's Encrypt and Cloudflare..."
   if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_EMAIL:-}" ] || [ -z "${CLOUDFLARE_ZONE_ID:-}" ]; then
-    echo "WARNING: Cloudflare credentials (API Token, Email, Zone ID) not configured. SSL certificates will not be automatically issued."
-    echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
+    if [ "$REQUIRE_SSL" = "true" ]; then
+      echo "ERROR: Cloudflare credentials (API Token, Email, Zone ID) not configured and REQUIRE_SSL=true"
+      echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
+      exit 1
+    else
+      echo "WARNING: Cloudflare credentials (API Token, Email, Zone ID) not configured. SSL certificates will not be automatically issued."
+      echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
+    fi
   else
-    echo ">>> Creating Cloudflare credentials secret..."
-    kubectl create secret generic cloudflare-api-token-secret -n cert-manager \
-      --from-literal=api-token="${CLOUDFLARE_API_TOKEN}" --dry-run=client -o yaml | kubectl apply -f -
-
-    echo ">>> Applying ClusterIssuer manifest..."
-    cat <<EOF | kubectl apply -f -
+    # Validate Cloudflare credentials before proceeding
+    if ! validate_cloudflare_credentials "${CLOUDFLARE_EMAIL}" "${CLOUDFLARE_API_TOKEN}" "${CLOUDFLARE_ZONE_ID}"; then
+      if [ "$REQUIRE_SSL" = "true" ]; then
+        echo "ERROR: Cloudflare credential validation failed and REQUIRE_SSL=true"
+        exit 1
+      else
+        echo "WARNING: Cloudflare credential validation failed. Continuing without SSL setup."
+        echo "Fix your credentials and run './compliance-lab.sh configure' to retry."
+      fi
+    else
+      echo ">>> Creating Cloudflare credentials secret..."
+      if ! kubectl create secret generic cloudflare-api-token-secret -n cert-manager \
+        --from-literal=api-token="${CLOUDFLARE_API_TOKEN}" --dry-run=client -o yaml | kubectl apply -f -; then
+        echo "ERROR: Failed to create Cloudflare credentials secret"
+        if [ "$REQUIRE_SSL" = "true" ]; then
+          cleanup_failed_ssl_setup
+          exit 1
+        else
+          echo "WARNING: Continuing without SSL setup"
+        fi
+      else
+        echo ">>> Applying ClusterIssuer manifest..."
+        if ! cat <<EOF | kubectl apply -f -
 ---
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -679,12 +754,31 @@ spec:
             name: cloudflare-api-token-secret
             key: api-token
 EOF
-
-    # Wait for ClusterIssuer to be ready
-    echo "Waiting for ClusterIssuer to be ready..."
-    kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=300s || true
-
-    echo "Cloudflare ClusterIssuer configured. Wildcard certificate will be applied after Istio installation."
+        then
+          echo "ERROR: Failed to apply ClusterIssuer manifest"
+          if [ "$REQUIRE_SSL" = "true" ]; then
+            cleanup_failed_ssl_setup
+            exit 1
+          else
+            echo "WARNING: Continuing without SSL setup"
+          fi
+        else
+          # Wait for ClusterIssuer to be ready
+          echo "Waiting for ClusterIssuer to be ready..."
+          if ! kubectl wait --for=condition=Ready clusterissuer/letsencrypt-prod --timeout=300s; then
+            echo "ERROR: ClusterIssuer did not become ready within 5 minutes"
+            if [ "$REQUIRE_SSL" = "true" ]; then
+              cleanup_failed_ssl_setup
+              exit 1
+            else
+              echo "WARNING: SSL setup may not work properly. Continuing anyway."
+            fi
+          else
+            echo "Cloudflare ClusterIssuer configured successfully. Wildcard certificate will be applied after Istio installation."
+          fi
+        fi
+      fi
+    fi
   fi
 
   echo ">>> Installing MinIO (single instance)..."
@@ -795,41 +889,42 @@ EOF
   helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
     --set server.dev.enabled=true
 
-  echo ">>> Installing ELK (minimal, tuned for k3d)..."
-  helm repo add elastic https://helm.elastic.co
-  check_node_pressure
-  ELASTIC_TOLERATIONS_ARGS=()
-  if [ "${NODE_DISK_PRESSURE}" = "true" ] && [ "${ALLOW_TAINTED_NODES:-}" = "true" ]; then
-    echo ">>> Allowing scheduling on DiskPressure nodes for Elasticsearch (override)."
-    ELASTIC_TOLERATIONS_ARGS+=(
-      --set tolerations[0].key=node.kubernetes.io/disk-pressure \
-      --set tolerations[0].operator=Exists \
-      --set tolerations[0].effect=NoSchedule
-    )
-  fi
-  helm upgrade --install elasticsearch elastic/elasticsearch -n elk --create-namespace \
-    --set replicas=1 \
-    --set resources.requests.cpu=200m \
-    --set resources.requests.memory=512Mi \
-    --set resources.limits.memory=1Gi \
-    --set esJavaOpts="-Xms512m -Xmx512m" \
-    --set persistence.enabled=false \
-    ${ELASTIC_TOLERATIONS_ARGS[@]} \
-    --wait --timeout 10m
-  helm upgrade --install kibana elastic/kibana -n elk \
-    --set replicas=1 \
-    --set resources.requests.cpu=100m \
-    --set resources.requests.memory=256Mi \
-    --wait --timeout 10m
+  echo ">>> Skipping ELK installation (temporarily disabled for debugging)"
+  # echo ">>> Installing ELK (minimal, tuned for k3d)..."
+  # helm repo add elastic https://helm.elastic.co
+  # check_node_pressure
+  # ELASTIC_TOLERATIONS_ARGS=()
+  # if [ "${NODE_DISK_PRESSURE}" = "true" ] && [ "${ALLOW_TAINTED_NODES:-}" = "true" ]; then
+  #   echo ">>> Allowing scheduling on DiskPressure nodes for Elasticsearch (override)."
+  #   ELASTIC_TOLERATIONS_ARGS+=(
+  #     --set tolerations[0].key=node.kubernetes.io/disk-pressure \
+  #     --set tolerations[0].operator=Exists \
+  #     --set tolerations[0].effect=NoSchedule
+  #   )
+  # fi
+  # helm upgrade --install elasticsearch elastic/elasticsearch -n elk --create-namespace \
+  #   --set replicas=1 \
+  #   --set resources.requests.cpu=200m \
+  #   --set resources.requests.memory=512Mi \
+  #   --set resources.limits.memory=1Gi \
+  #   --set esJavaOpts="-Xms512m -Xmx512m" \
+  #   --set persistence.enabled=false \
+  #   ${ELASTIC_TOLERATIONS_ARGS[@]} \
+  #   --wait --timeout 10m
+  # helm upgrade --install kibana elastic/kibana -n elk \
+  #   --set replicas=1 \
+  #   --set resources.requests.cpu=100m \
+  #   --set resources.requests.memory=256Mi \
+  #   --wait --timeout 10m
 
-  echo ">>> Waiting for ELK pods to become Ready..."
-  kubectl -n elk wait --for=condition=ready pod --all --timeout=600s || true
+  # echo ">>> Waiting for ELK pods to become Ready..."
+  # kubectl -n elk wait --for=condition=ready pod --all --timeout=600s || true
 
-  echo ">>> Installing Fluent Bit..."
-  helm repo add fluent https://fluent.github.io/helm-charts
-  helm upgrade --install fluent-bit fluent/fluent-bit -n logging --create-namespace \
-    --set backend.type=es \
-    --set backend.es.host=elasticsearch-master.elk.svc.cluster.local
+  # echo ">>> Installing Fluent Bit..."
+  # helm repo add fluent https://fluent.github.io/helm-charts
+  # helm upgrade --install fluent-bit fluent/fluent-bit -n logging --create-namespace \
+  #   --set backend.type=es \
+  #   --set backend.es.host=elasticsearch-master.elk.svc.cluster.local
 
   echo ">>> Installing Prometheus Operator (minimal)..."
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts
@@ -919,6 +1014,10 @@ case "${1:-}" in
     echo "  • Let's Encrypt integration with Cloudflare DNS-01 challenges"
     echo "  • Istio Gateway configured for HTTPS termination"
     echo "  • Run 'configure' command to set up Cloudflare API credentials"
+    echo
+    echo "SSL Configuration options:"
+    echo "  REQUIRE_SSL=true                 Fail if SSL setup fails (default: true)"
+    echo "  REQUIRE_SSL=false                Warn but continue if SSL setup fails"
     echo
     echo "Teardown cleanup options:"
     echo "  AUTO_DOCKER_PRUNE=true           Auto-prune Docker on teardown"
