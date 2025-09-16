@@ -718,7 +718,9 @@ EOF
         fi
       else
         echo ">>> Applying ClusterIssuer manifest..."
-        if ! cat <<EOF | kubectl apply -f -
+        # Create temporary file to debug YAML structure
+        TEMP_MANIFEST=$(mktemp)
+        cat > "$TEMP_MANIFEST" <<EOF
 ---
 apiVersion: cert-manager.io/v1
 kind: ClusterIssuer
@@ -754,8 +756,12 @@ spec:
             name: cloudflare-api-token-secret
             key: api-token
 EOF
-        then
+        echo ">>> Generated ClusterIssuer manifest:"
+        cat "$TEMP_MANIFEST"
+        echo ">>> Applying manifest..."
+        if ! kubectl apply -f "$TEMP_MANIFEST"; then
           echo "ERROR: Failed to apply ClusterIssuer manifest"
+          rm -f "$TEMP_MANIFEST"
           if [ "$REQUIRE_SSL" = "true" ]; then
             cleanup_failed_ssl_setup
             exit 1
