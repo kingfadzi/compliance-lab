@@ -658,8 +658,6 @@ spec:
     solvers:
     - dns01:
         cloudflare:
-          email: "${CLOUDFLARE_EMAIL}"
-          zoneID: "${CLOUDFLARE_ZONE_ID}"
           apiTokenSecretRef:
             name: cloudflare-api-token-secret
             key: api-token
@@ -677,8 +675,6 @@ spec:
     solvers:
     - dns01:
         cloudflare:
-          email: "${CLOUDFLARE_EMAIL}"
-          zoneID: "${CLOUDFLARE_ZONE_ID}"
           apiTokenSecretRef:
             name: cloudflare-api-token-secret
             key: api-token
