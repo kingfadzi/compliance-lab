@@ -6,6 +6,7 @@
 #
 # Example for a hypothetical "myapp" service:
 ---
+
 apiVersion: networking.istio.io/v1beta1
 kind: VirtualService
 metadata:
