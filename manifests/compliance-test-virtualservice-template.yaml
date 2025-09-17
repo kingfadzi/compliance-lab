@@ -1,0 +1,20 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: compliance-test-web
+  namespace: compliance-test
+spec:
+  hosts:
+  - app.${K3S_INGRESS_DOMAIN}
+  gateways:
+  - istio-system/${GATEWAY_NAME}
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: web
+        port:
+          number: 80

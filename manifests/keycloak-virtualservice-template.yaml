@@ -1,0 +1,20 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: keycloak
+  namespace: keycloak
+spec:
+  hosts:
+  - keycloak.${K3S_INGRESS_DOMAIN}
+  gateways:
+  - istio-system/${GATEWAY_NAME}
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: keycloak
+        port:
+          number: 8080

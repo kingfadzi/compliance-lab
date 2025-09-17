@@ -1,0 +1,40 @@
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: minio
+  namespace: minio
+spec:
+  hosts:
+  - minio.${K3S_INGRESS_DOMAIN}
+  gateways:
+  - istio-system/${GATEWAY_NAME}
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: minio
+        port:
+          number: 9000
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: minio-console
+  namespace: minio
+spec:
+  hosts:
+  - minio-console.${K3S_INGRESS_DOMAIN}
+  gateways:
+  - istio-system/${GATEWAY_NAME}
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: minio-console
+        port:
+          number: 9001

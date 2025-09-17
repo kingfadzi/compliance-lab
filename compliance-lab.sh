@@ -2,1429 +2,688 @@
 set -euo pipefail
 
 # --- Configuration ---
-CLUSTER_NAME="compliance-lab"
-RANCHER_NAME="rancher"
-# This domain is used for services inside the k3s cluster, like Keycloak.
-# The external Rancher instance will have its own separate URL.
-K3S_INGRESS_DOMAIN="dev.butterflycluster.com"
+# Default cluster name (can be overridden by config files)
+CLUSTER_NAME="${CLUSTER_NAME:-compliance-lab}"
 
-# --- Cloudflare Configuration (for Let's Encrypt DNS-01 challenges) ---
-# Use environment variables if set, otherwise default to empty
+# --- Environment Detection and Domain Configuration ---
+detect_environment() {
+  local hostname=$(hostname 2>/dev/null || echo "unknown")
+
+  # Check for environment-specific config files first
+  if [ -f "config/compliance-lab.local" ]; then
+    echo "local"
+  elif [ -f "config/compliance-lab.dev" ]; then
+    echo "dev"
+  elif [ -f "config/compliance-lab.staging" ]; then
+    echo "staging"
+  elif [ -f "config/compliance-lab.prod" ]; then
+    echo "prod"
+  # Fallback to hostname detection
+  elif [[ "$hostname" =~ ^(localhost|.*\.local)$ ]]; then
+    echo "local"
+  elif [[ "$hostname" =~ dev ]]; then
+    echo "dev"
+  elif [[ "$hostname" =~ (stage|staging) ]]; then
+    echo "staging"
+  elif [[ "$hostname" =~ (prod|production) ]]; then
+    echo "prod"
+  else
+    echo "dev"
+  fi
+}
+
+set_ingress_domain() {
+  local env="$1"
+  # Set default domain only if not already configured
+  if [ -z "${K3S_INGRESS_DOMAIN:-}" ]; then
+    K3S_INGRESS_DOMAIN="${env}.example.com"
+  fi
+}
+
+# Initialize environment and domain
+DETECTED_ENV=$(detect_environment)
+set_ingress_domain "$DETECTED_ENV"
+
+# Load environment-specific config file
+[ -f "config/compliance-lab.${DETECTED_ENV}" ] && source "config/compliance-lab.${DETECTED_ENV}" || true
+
+# Apply any overrides from config files
+CLUSTER_NAME="${CLUSTER_NAME:-compliance-lab}"
+
+# Export domain for template substitution
+export K3S_INGRESS_DOMAIN
+
+# Set production certificates based on environment
+USE_PROD_CERTS=false
+if [ "$DETECTED_ENV" = "prod" ]; then
+  USE_PROD_CERTS=true
+fi
+
+# Allow config file override
+if [ "${USE_PROD_CERTS:-}" = "true" ]; then
+  USE_PROD_CERTS=true
+fi
+
+# --- SSL Configuration ---
 CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN:-}"
 CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL:-}"
+CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID:-}"
 
-# --- MinIO Credentials (used for Velero S3 backend) ---
-MINIO_ACCESS_KEY="myaccesskey"
-MINIO_SECRET_KEY="mysecretkey"
+# Export Cloudflare variables for template substitution
+export CLOUDFLARE_API_TOKEN
+export CLOUDFLARE_EMAIL
+export CLOUDFLARE_ZONE_ID
 
-# --- Cleanup behavior (tunable via env) ---
-# When true, automatically prune docker artifacts during teardown.
-AUTO_DOCKER_PRUNE=${AUTO_DOCKER_PRUNE:-false}
-# When true (and pruning), also prune volumes (more aggressive space reclaim).
-PRUNE_DOCKER_VOLUMES=${PRUNE_DOCKER_VOLUMES:-false}
-# When true, purge Rancher filesystem state under /var/lib/rancher during cleanup.
-AUTO_RANCHER_PURGE=${AUTO_RANCHER_PURGE:-false}
-# Path to Rancher state directory on host
-RANCHER_DIR=${RANCHER_DIR:-/var/lib/rancher}
-
-# --- SSL Configuration behavior (tunable via env) ---
-# When true, SSL setup must succeed or the script fails.
-# When false, SSL setup failures are warned but script continues.
-REQUIRE_SSL=${REQUIRE_SSL:-true}
-# When true, delete any existing ACME TXT records before requesting certs
-CLEANUP_ACME_DNS=${CLEANUP_ACME_DNS:-false}
-# When true, wait for the wildcard Certificate to become Ready
-WAIT_FOR_CERT_READY=${WAIT_FOR_CERT_READY:-true}
-# When true, restart CoreDNS before requesting certs to clear negative caches
-FLUSH_COREDNS_ON_ISSUANCE=${FLUSH_COREDNS_ON_ISSUANCE:-false}
-# When true, attempt to reuse existing certs by restoring backups and skipping issuance if valid
-REUSE_EXISTING_CERTS=${REUSE_EXISTING_CERTS:-true}
-# Use Let's Encrypt staging issuer for testing (untrusted, high rate limits).
-# Set to true to switch the wildcard Certificate's issuer to 'letsencrypt-staging'.
-USE_STAGING_SSL=${USE_STAGING_SSL:-false}
-# When true, configure cert-manager to use public DNS resolvers for DNS01 propagation checks.
-# This avoids slow/negative caching from cluster DNS.
-USE_DNS_PUBLIC_RESOLVERS=${USE_DNS_PUBLIC_RESOLVERS:-true}
-# Minimum days remaining on an existing cert to consider early rotation.
-# Set default to 0 so we do NOT rotate unless the cert is actually expired.
-MIN_CERT_VALID_DAYS=${MIN_CERT_VALID_DAYS:-0}
-
-# --- Local SSL Certificate Paths ---
-# Used for the external Rancher Docker container
-CERT_DIR="/etc/ssl"
-CERT_FILE="$CERT_DIR/butterflycluster_com.crt.pem"
-KEY_FILE="$CERT_DIR/butterflycluster_com.key.pem"
-CA_FILE="$CERT_DIR/butterflycluster_com.ca-bundle"
-
-# --- Rancher API Details ---
-# Configuration is loaded from rancher.env file.
-# Run './compliance-lab.sh configure' to set these values.
-RANCHER_URL=""
-RANCHER_BEARER_TOKEN=""
-
+# --- Rancher Configuration (Optional) ---
+RANCHER_URL="${RANCHER_URL:-}"
+RANCHER_BEARER_TOKEN="${RANCHER_BEARER_TOKEN:-}"
 
 # --- Helper Functions ---
 
-load_config() {
-  if [ -f "rancher.env" ]; then
-    source "rancher.env"
-  fi
-  # removed stray fi from legacy block
-}
-
-ensure_rancher_available() {
-  # Ensure Rancher container is up and API is reachable at RANCHER_URL
-  local url="${RANCHER_URL}"
-  if [ -z "$url" ]; then
-    echo "ERROR: RANCHER_URL not set. Run './compliance-lab.sh configure' first."
-    exit 1
-  fi
-  # removed: stray fi from legacy block
-
-  echo ">>> Ensuring Rancher is running at: ${url}"
-  if ! docker ps -q -f name=^/${RANCHER_NAME}$ >/dev/null; then
-    echo ">>> Rancher container not running; attempting to start it..."
-    rancher_up
-  fi
-
-  echo ">>> Waiting for Rancher API to become reachable..."
-  local tries=0
-  local max_tries=60
-  local status
-  while [ $tries -lt $max_tries ]; do
-    status=$(curl -sk -o /dev/null -w "%{http_code}" "${url}/v3-public" || true)
-    if [ "$status" = "200" ]; then
-      echo ">>> Rancher API is reachable."
-      return 0
-    fi
-    tries=$((tries+1))
-    sleep 5
-  done
-  echo "ERROR: Rancher API not reachable at ${url} after $((5*max_tries))s."
+fail() {
+  echo "ERROR: $1" >&2
   exit 1
 }
 
-check_config() {
-  if [ -z "$RANCHER_URL" ] || [ -z "$RANCHER_BEARER_TOKEN" ] || [[ "$RANCHER_URL" == *"your-rancher-url"* ]]; then
-    echo "ERROR: Rancher API details are not configured."
-    echo "Please run './compliance-lab.sh configure' first."
-    exit 1
-  fi
+log() {
+  echo ">>> $1"
 }
+
 
 check_deps() {
-  echo ">>> Checking for dependencies..."
-  local missing=0
-  for cmd in docker k3d kubectl helm istioctl velero curl jq; do
-    if ! command -v "$cmd" &> /dev/null; then
-      echo "ERROR: '$cmd' command not found. Please install it (try: ./setup-deps.sh)."
-      missing=1
-    fi
+  log "Checking dependencies..."
+  local missing=()
+  for cmd in k3d kubectl helm istioctl velero curl jq; do
+    command -v "$cmd" >/dev/null || missing+=("$cmd")
   done
-  if [ "$missing" -eq 1 ]; then
-    exit 1
-  fi
+  [ ${#missing[@]} -eq 0 ] || fail "Missing dependencies: ${missing[*]}. Run ./setup-deps.sh"
 }
 
-validate_cloudflare_credentials() {
-  local cf_email="$1"
-  local cf_token="$2"
-  local cf_zone_id="$3"
-
-  echo ">>> Validating Cloudflare API credentials..."
-
-  # Test API token validity by fetching zone info
-  local api_response
-  local http_status
-
-  api_response=$(curl -s -w "\n%{http_code}" -X GET "https://api.cloudflare.com/client/v4/zones/${cf_zone_id}" \
-    -H "Authorization: Bearer ${cf_token}" \
-    -H "Content-Type: application/json" 2>/dev/null)
-
-  http_status=$(echo "$api_response" | tail -n1)
-  api_response=$(echo "$api_response" | head -n -1)
-
-  if [ "$http_status" != "200" ]; then
-    echo "ERROR: Cloudflare API validation failed (HTTP $http_status)"
-    if [ -n "$api_response" ]; then
-      echo "Response: $api_response"
-    fi
-    return 1
-  fi
-
-  # Check if we have DNS edit permissions
-  local zone_name
-  zone_name=$(echo "$api_response" | jq -r '.result.name // empty' 2>/dev/null)
-
-  if [ -z "$zone_name" ]; then
-    echo "ERROR: Failed to retrieve zone information from Cloudflare API"
-    return 1
-  fi
-
-  echo ">>> Cloudflare credentials validated successfully for zone: $zone_name"
-  return 0
+check_cloudflare_config() {
+  [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL" ] && [ -n "$CLOUDFLARE_ZONE_ID" ] || {
+    fail "Cloudflare not configured. Run: ./compliance-lab.sh configure"
+  }
 }
 
-cleanup_failed_ssl_setup() {
-  echo ">>> Cleaning up failed SSL setup..."
-  kubectl delete secret cloudflare-api-token-secret -n cert-manager --ignore-not-found=true
-  kubectl delete clusterissuer letsencrypt-staging --ignore-not-found=true
-  kubectl delete clusterissuer letsencrypt-prod --ignore-not-found=true
-  echo ">>> SSL setup cleanup completed"
-}
+cert_is_valid() {
+  local ns="$1" secret="$2"
+  kubectl -n "$ns" get secret "$secret" >/dev/null 2>&1 || return 1
 
-cleanup_acme_dns_records() {
-  local zone_id="${CLOUDFLARE_ZONE_ID:-}"
-  local api_token="${CLOUDFLARE_API_TOKEN:-}"
-  local target="_acme-challenge.${K3S_INGRESS_DOMAIN}"
-  if [ -z "$zone_id" ] || [ -z "$api_token" ]; then
-    echo "WARNING: Skipping ACME DNS cleanup (Cloudflare token/zone not configured)."
-    return 0
-  fi
-  echo ">>> Searching for existing ACME TXT records at ${target} in Cloudflare..."
-  local list_resp
-  list_resp=$(curl -s -X GET "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records?type=TXT&name=${target}" \
-    -H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json")
-  local success
-  success=$(echo "$list_resp" | jq -r '.success')
-  if [ "$success" != "true" ]; then
-    echo "WARNING: Failed to list ACME TXT records (Cloudflare API error). Response: $(echo "$list_resp" | jq -c '.')"
-    return 0
-  fi
-  local ids
-  ids=($(echo "$list_resp" | jq -r '.result[]?.id'))
-  if [ ${#ids[@]} -eq 0 ]; then
-    echo ">>> No ACME TXT records to delete."
-    return 0
-  fi
-  echo ">>> Deleting ${#ids[@]} ACME TXT record(s) at ${target}..."
-  local id resp del_ok
-  for id in "${ids[@]}"; do
-    resp=$(curl -s -X DELETE "https://api.cloudflare.com/client/v4/zones/${zone_id}/dns_records/${id}" \
-      -H "Authorization: Bearer ${api_token}" -H "Content-Type: application/json")
-    del_ok=$(echo "$resp" | jq -r '.success')
-    if [ "$del_ok" = "true" ]; then
-      echo " - Deleted record id ${id}"
-    else
-      echo " - Failed to delete record id ${id}. Response: $(echo "$resp" | jq -c '.')"
-    fi
-  done
-}
+  local cert_data
+  cert_data=$(kubectl -n "$ns" get secret "$secret" -o jsonpath='{.data.tls\.crt}' 2>/dev/null) || return 1
 
-wait_for_certificate_ready() {
-  local ns="$1"; shift
-  local name="$1"; shift
-  local timeout_secs="${1:-600}"; shift || true
-  echo ">>> Waiting for Certificate ${ns}/${name} to become Ready (timeout ${timeout_secs}s)..."
-  local start_ts=$(date +%s)
-  local last_log_ts=$start_ts
-  local nudge_done="false"
-  local iter=0
-  local max_iters=$(( timeout_secs / 5 ))
-  [ $max_iters -le 0 ] && max_iters=1
-  while true; do
-    if kubectl -n "$ns" get certificate "$name" >/dev/null 2>&1; then
-      local cert_json cond reason message
-      cert_json=$(kubectl -n "$ns" get certificate "$name" -o json 2>/dev/null || echo '{}')
-      cond=$(echo "$cert_json" | jq -r '.status.conditions[]? | select(.type=="Ready") | .status' 2>/dev/null || true)
-      reason=$(echo "$cert_json" | jq -r '.status.conditions[]? | select(.type=="Ready") | .reason // empty' 2>/dev/null || true)
-      message=$(echo "$cert_json" | jq -r '.status.conditions[]? | select(.type=="Ready") | .message // empty' 2>/dev/null || true)
-      if [ "$cond" = "True" ]; then
-        echo ">>> Certificate is Ready."
-        return 0
-      fi
-      # Periodic debug every 15s
-      local now=$(date +%s)
-      if [ $((now - last_log_ts)) -ge 15 ]; then
-        last_log_ts=$now
-        # Summarize current ACME flow objects
-        local req_cnt ord_cnt chal_cnt chal_summary issuer_ready
-        req_cnt=$(kubectl -n "$ns" get certificaterequests.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 0)
-        ord_cnt=$(kubectl -n "$ns" get orders.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 0)
-        chal_cnt=$(kubectl -n "$ns" get challenges.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq '.items | length' 2>/dev/null || echo 0)
-        chal_summary=$(kubectl -n "$ns" get challenges.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o json 2>/dev/null | jq -r '[.items[]? | {dnsName:.spec.dnsName, presented:.status.presented, reason:.status.reason, state:.status.state}]' 2>/dev/null || echo '[]')
-        issuer_ready=$(kubectl get clusterissuer letsencrypt-prod -o json 2>/dev/null | jq -r '.status.conditions[]? | select(.type=="Ready") | .status' 2>/dev/null || echo "")
-        echo "... cert Ready=${cond:-Unknown} reason='${reason}'"
-        echo "... CRs=${req_cnt} Orders=${ord_cnt} Challenges=${chal_cnt} IssuerReady=${issuer_ready}"
-        echo "... Challenge summary: ${chal_summary}"
-        # If no activity after ~90s, force a reconcile by bumping an annotation
-        if [ "$nudge_done" != "true" ] && [ $((now - start_ts)) -ge 90 ] && [ "${req_cnt:-0}" -eq 0 ] && [ "${ord_cnt:-0}" -eq 0 ] && [ "${chal_cnt:-0}" -eq 0 ]; then
-          echo ">>> No issuance activity detected after 90s; nudging cert-manager to reconcile certificate..."
-          kubectl -n "$ns" annotate certificate "$name" cert-manager.io/renewal-reason="force-issue-$(date +%s)" --overwrite || true
-          nudge_done="true"
-        fi
-      fi
-    fi
-    local now=$(date +%s)
-    iter=$((iter+1))
-    if [ $((now-start_ts)) -ge "$timeout_secs" ] || [ $iter -ge $max_iters ]; then
-      echo "ERROR: Certificate ${ns}/${name} not Ready after ${timeout_secs}s."
-      echo ">>> Certificate describe:"
-      kubectl -n "$ns" describe certificate "$name" || true
-      echo ">>> CertificateRequests:"
-      kubectl -n "$ns" get certificaterequests.cert-manager.io -l cert-manager.io/certificate-name="$name" -o wide || true
-      echo ">>> Orders:"
-      kubectl -n "$ns" get orders.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o wide || true
-      echo ">>> Challenges:"
-      kubectl -n "$ns" get challenges.acme.cert-manager.io -l cert-manager.io/certificate-name="$name" -o wide || true
-      echo ">>> Tail cert-manager controller logs:"
-      kubectl -n cert-manager logs -l app=cert-manager --tail=200 || true
-      return 1
-    fi
-    sleep 5
-  done
-}
-
-# --- Certificate reuse helpers ---
-
-_strip_k8s_metadata_json() {
-  jq 'del(.metadata.creationTimestamp,.metadata.resourceVersion,.metadata.uid,.metadata.selfLink,.metadata.generation,.metadata.annotations."kubectl.kubernetes.io/last-applied-configuration",.metadata.managedFields,.metadata.ownerReferences,.metadata.namespace)'
-}
-
-backup_cert_artifacts() {
-  mkdir -p manifests/backup
-  echo ">>> Backing up TLS secret istio-system/dev-wildcard-tls and ACME account secret cert-manager/letsencrypt-prod (if present)..."
-  if kubectl -n istio-system get secret dev-wildcard-tls >/dev/null 2>&1; then
-    kubectl -n istio-system get secret dev-wildcard-tls -o json | _strip_k8s_metadata_json > manifests/backup/istio-system.dev-wildcard-tls.json || true
-  fi
-  if kubectl -n cert-manager get secret letsencrypt-prod >/dev/null 2>&1; then
-    kubectl -n cert-manager get secret letsencrypt-prod -o json | _strip_k8s_metadata_json > manifests/backup/cert-manager.letsencrypt-prod.json || true
-  fi
-}
-
-restore_cert_artifacts() {
-  local restored=0
-  if [ -f manifests/backup/cert-manager.letsencrypt-prod.json ]; then
-    echo ">>> Restoring ACME account secret (cert-manager/letsencrypt-prod) from backup..."
-    kubectl apply -f manifests/backup/cert-manager.letsencrypt-prod.json && restored=1 || true
-  fi
-  if [ -f manifests/backup/istio-system.dev-wildcard-tls.json ]; then
-    echo ">>> Restoring TLS secret (istio-system/dev-wildcard-tls) from backup..."
-    kubectl apply -f manifests/backup/istio-system.dev-wildcard-tls.json && restored=1 || true
-  fi
-  return $restored
-}
-
-cert_days_remaining() {
-  # Prints integer days remaining until expiration, or 0 if unavailable
-  local ns="$1"; shift
-  local name="$1"; shift
   local tmp=$(mktemp)
-  if ! kubectl -n "$ns" get secret "$name" -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d > "$tmp"; then
-    rm -f "$tmp"; echo 0; return
-  fi
-  local not_after
-  not_after=$(openssl x509 -enddate -noout -in "$tmp" 2>/dev/null | cut -d= -f2-)
-  rm -f "$tmp"
-  if [ -z "$not_after" ]; then echo 0; return; fi
-  local exp_ts now_ts days
-  exp_ts=$(date -d "$not_after" +%s 2>/dev/null || echo 0)
-  now_ts=$(date +%s)
-  if [ "$exp_ts" -le 0 ]; then echo 0; return; fi
-  days=$(( (exp_ts - now_ts) / 86400 ))
-  [ $days -lt 0 ] && days=0
-  echo $days
-}
+  echo "$cert_data" | base64 -d > "$tmp"
 
-# Returns 0 if the certificate is expired or missing, 1 if still valid
-cert_is_expired() {
-  local ns="$1"; shift
-  local name="$1"; shift
-  local tmp=$(mktemp)
-  if ! kubectl -n "$ns" get secret "$name" -o jsonpath='{.data.tls\.crt}' 2>/dev/null | base64 -d > "$tmp"; then
-    rm -f "$tmp"; return 0
-  fi
-  # openssl -checkend 0 returns 0 if the cert will be valid for at least 0 more seconds (i.e., not expired)
-  if openssl x509 -checkend 0 -noout -in "$tmp" >/dev/null 2>&1; then
-    rm -f "$tmp"; return 1
+  # Check if cert is valid for at least 7 days
+  if openssl x509 -checkend 604800 -noout -in "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 0
   else
-    rm -f "$tmp"; return 0
-  fi
-}
-
-# --- Configuration Management ---
-
-configure_cloudflare() {
-  echo "--- Cloudflare Configuration for SSL Certificates ---"
-  echo "This configures Cloudflare API access for Let's Encrypt DNS-01 challenges."
-  echo
-
-  # Use environment variables as defaults if available
-  local default_email="${CLOUDFLARE_EMAIL:-}"
-  local default_token="${CLOUDFLARE_API_TOKEN:-}"
-
-  if [ -n "$default_email" ]; then
-    read -p "Enter your Cloudflare email address [$default_email]: " cf_email || true
-    read -p "Enter your Cloudflare email address: " cf_email || true
-  fi
-  cf_email=${cf_email:-$default_email}
-
-  if [ -n "$default_token" ]; then
-    read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required) [***hidden***]: " cf_token || true
-  # removed legacy sed branch
-    read -sp "Enter your Cloudflare API token (Zone:DNS:Edit permission required): " cf_token || true
-  fi
-  echo
-  cf_token=${cf_token:-$default_token}
-
-  local default_zone_id="${CLOUDFLARE_ZONE_ID:-}"
-  if [ -n "$default_zone_id" ]; then
-    read -p "Enter your Cloudflare Zone ID [$default_zone_id]: " cf_zone_id || true
-  else
-    read -p "Enter your Cloudflare Zone ID: " cf_zone_id || true
-  fi
-  cf_zone_id=${cf_zone_id:-$default_zone_id}
-
-  if [ -z "$cf_email" ] || [ -z "$cf_token" ] || [ -z "$cf_zone_id" ]; then
-    echo "Cloudflare email, API token, and Zone ID cannot be empty."
+    rm -f "$tmp"
     return 1
   fi
-
-  CLOUDFLARE_EMAIL="$cf_email"
-  CLOUDFLARE_API_TOKEN="$cf_token"
-  CLOUDFLARE_ZONE_ID="$cf_zone_id"
-
-  echo "Cloudflare configuration set successfully."
 }
 
-configure_all() {
-  configure_cloudflare
-  configure_rancher
-}
+backup_certificate() {
+  local ns="$1" secret="$2"
+  local backup_dir="./cluster-state"
+  local backup_file="$backup_dir/${secret}.yaml"
 
-configure_rancher() {
-  echo "--- Rancher API Configuration ---"
-  local default_url
-  default_url="${RANCHER_URL:-https://charon.butterflycluster.com:8443}"
+  mkdir -p "$backup_dir"
 
-  read -p "Enter your Rancher URL [${default_url}]: " url || true
-  url=${url:-$default_url}
-
-  read -p "Admin username [admin]: " username || true
-  username=${username:-admin}
-
-  read -sp "Admin password: " password || true
-  echo
-
-  if [ -z "$url" ] || [ -z "$username" ] || [ -z "$password" ]; then
-    echo "URL, username, and password cannot be empty. Configuration failed."
-    exit 1
-  fi
-
-  echo ">>> Checking Rancher API reachability..."
-  api_status=$(curl -sk -m 10 -o /dev/null -w "%{http_code}" "${url}/v3-public" || true)
-  if [ -z "$api_status" ] || [ "$api_status" = "000" ]; then
-    echo "ERROR: Unable to reach Rancher at ${url}. Ensure Rancher is running and accessible."
-    exit 1
-  fi
-
-  # If an existing bearer token is present and valid, reuse it
-  if [ -n "${RANCHER_BEARER_TOKEN:-}" ]; then
-    echo ">>> Validating existing API token..."
-    validate_status=$(curl -sk -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" "${url}/v3" || true)
-    if [ "$validate_status" = "200" ]; then
-      echo ">>> Existing token is valid. Updating rancher.env with current settings."
-      cat > rancher.env << EOL
-# Rancher API Configuration
-export RANCHER_URL="${url}"
-export RANCHER_BEARER_TOKEN="${RANCHER_BEARER_TOKEN}"
-
-# SSL certificates on the host (used by the Rancher container)
-export CERT_DIR="/etc/ssl"
-export CERT_FILE="/etc/ssl/butterflycluster_com.crt.pem"
-export KEY_FILE="/etc/ssl/butterflycluster_com.key.pem"
-export CA_FILE="/etc/ssl/butterflycluster_com.ca-bundle"
-
-# Cloudflare Configuration (for Let's Encrypt DNS-01 challenges)
-export CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
-export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
-export CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID}"
-EOL
-      echo "Configuration saved successfully to rancher.env."
-      return
-    else
-      echo ">>> Existing token is invalid or expired. Generating a new one..."
-    fi
-  fi
-
-  echo ">>> Authenticating to Rancher..."
-  # Login to obtain a session token for API calls
-  if ! LOGIN_JSON=$(curl -s -k -X POST "${url}/v3-public/localProviders/local?action=login" \
-    -H 'Content-Type: application/json' \
-    -d "{\"username\":\"${username}\",\"password\":\"${password}\"}"); then
-    echo "ERROR: Failed to reach Rancher login endpoint."
-    exit 1
-  fi
-
-  LOGIN_BEARER=$(echo "$LOGIN_JSON" | jq -r '.token // empty')
-  if [ -z "$LOGIN_BEARER" ] || [ "$LOGIN_BEARER" = "null" ]; then
-    echo "ERROR: Failed to authenticate to Rancher. Check URL and credentials."
-    echo "Response: $(echo "$LOGIN_JSON" | jq -c '.')"
-    exit 1
-  fi
-
-  echo ">>> Ensuring Rancher server-url is set..."
-  SET_URL_STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" -X PUT "${url}/v3/settings/server-url" \
-    -H 'Content-Type: application/json' \
-    -H "Authorization: Bearer ${LOGIN_BEARER}" \
-    -d "{\"name\":\"server-url\",\"value\":\"${url}\"}")
-  if [ "$SET_URL_STATUS" -ge 200 ] && [ "$SET_URL_STATUS" -lt 300 ]; then
-    echo ">>> server-url set to ${url}"
-  else
-    echo "WARNING: Failed to set server-url (HTTP ${SET_URL_STATUS}). Continuing."
-  fi
-
-  echo ">>> Creating a long-lived API token..."
-  # Try to find an existing token by name and reuse only if secret is available (usually not retrievable later)
-  local token_name
-  token_name="compliance-lab-$(date +%s)"
-
-  if ! CREATE_JSON=$(curl -s -k -X POST "${url}/v3/token" \
-    -H "Authorization: Bearer ${LOGIN_BEARER}" \
-    -H 'Content-Type: application/json' \
-    -d "{\"type\":\"token\",\"name\":\"${token_name}\",\"ttl\":0}"); then
-    echo "ERROR: Failed to create API token."
-    exit 1
-  fi
-
-  TOKEN_ID=$(echo "$CREATE_JSON" | jq -r '.id // empty')
-  TOKEN_SECRET=$(echo "$CREATE_JSON" | jq -r '.token // empty')
-  if [ -z "$TOKEN_ID" ] || [ -z "$TOKEN_SECRET" ] || [ "$TOKEN_ID" = "null" ] || [ "$TOKEN_SECRET" = "null" ]; then
-    echo "ERROR: Failed to create API token."
-    echo "Response: $(echo "$CREATE_JSON" | jq -c '.')"
-    exit 1
-  fi
-  NEW_BEARER="${TOKEN_ID}:${TOKEN_SECRET}"
-
-  echo "Saving configuration to rancher.env..."
-  cat > rancher.env << EOL
-# Rancher API Configuration
-export RANCHER_URL="${url}"
-export RANCHER_BEARER_TOKEN="${NEW_BEARER}"
-
-# SSL certificates on the host (used by the Rancher container)
-export CERT_DIR="/etc/ssl"
-export CERT_FILE="/etc/ssl/butterflycluster_com.crt.pem"
-export KEY_FILE="/etc/ssl/butterflycluster_com.key.pem"
-export CA_FILE="/etc/ssl/butterflycluster_com.ca-bundle"
-
-# Cloudflare Configuration (for Let's Encrypt DNS-01 challenges)
-export CLOUDFLARE_EMAIL="${CLOUDFLARE_EMAIL}"
-export CLOUDFLARE_API_TOKEN="${CLOUDFLARE_API_TOKEN}"
-export CLOUDFLARE_ZONE_ID="${CLOUDFLARE_ZONE_ID}"
-EOL
-  echo "Configuration saved successfully to rancher.env."
-}
-
-# --- Cluster Health Checks ---
-
-check_node_pressure() {
-  echo ">>> Checking node conditions..."
-  NODE_DISK_PRESSURE="false"
-  NODE_MEM_PRESSURE="false"
-  if kubectl get nodes -o json | jq -e '.items[].status.conditions[] | select(.type=="DiskPressure" and .status=="True")' >/dev/null 2>&1; then
-    NODE_DISK_PRESSURE="true"
-    echo "WARNING: One or more nodes report DiskPressure. Consider freeing disk space on the host (e.g., prune images, clean /var)."
-  fi
-  if kubectl get nodes -o json | jq -e '.items[].status.conditions[] | select(.type=="MemoryPressure" and .status=="True")' >/dev/null 2>&1; then
-    NODE_MEM_PRESSURE="true"
-    echo "WARNING: One or more nodes report MemoryPressure. Components may fail to schedule."
+  if kubectl -n "$ns" get secret "$secret" >/dev/null 2>&1; then
+    kubectl -n "$ns" get secret "$secret" -o yaml > "$backup_file"
+    log "Certificate backed up: $secret"
   fi
 }
 
-# Lightweight readiness gate for heavy components
-wait_for_pods_ready() {
-  local ns="$1"; shift
-  local selector="$1"; shift
-  local min_ready="$1"; shift
-  local timeout_secs="$1"; shift
-  local label_arg=()
-  if [ -n "$selector" ]; then
-    label_arg=(-l "$selector")
-  fi
-  echo ">>> Waiting for at least ${min_ready} Ready pod(s) in ns='${ns}' selector='${selector}' (timeout ${timeout_secs}s)"
-  local start_ts=$(date +%s)
-  while true; do
-    local pods_json
-    pods_json=$(kubectl -n "$ns" get pods "${label_arg[@]}" -o json 2>/dev/null || echo '{}')
-    local ready
-    ready=$(echo "$pods_json" | jq '[.items[]? | select(.status.phase=="Running") | select( (.status.containerStatuses // []) | all(.ready==true) ) ] | length')
-    if [ "${ready:-0}" -ge "$min_ready" ]; then
-      echo ">>> ${ns} has ${ready} Ready pod(s) for selector '${selector}'."
+restore_certificate() {
+  local ns="$1" secret="$2"
+  local backup_dir="./cluster-state"
+  local backup_file="$backup_dir/${secret}.yaml"
+
+  if [ -f "$backup_file" ]; then
+    # Ensure namespace exists
+    kubectl create namespace "$ns" >/dev/null 2>&1 || true
+
+    # Restore certificate secret
+    kubectl apply -f "$backup_file" >/dev/null 2>&1
+
+    # Verify restoration was successful
+    if kubectl -n "$ns" get secret "$secret" >/dev/null 2>&1; then
+      log "Certificate restored from backup: $secret"
       return 0
     fi
+  fi
+
+  return 1
+}
+
+cert_is_valid_from_backup() {
+  local ns="$1" secret="$2"
+  local backup_dir="./cluster-state"
+  local backup_file="$backup_dir/${secret}.yaml"
+
+  [ -f "$backup_file" ] || return 1
+
+  # Extract certificate data from backup file
+  local cert_data
+  cert_data=$(grep 'tls.crt:' "$backup_file" | cut -d' ' -f4) || return 1
+
+  local tmp=$(mktemp)
+  echo "$cert_data" | base64 -d > "$tmp" 2>/dev/null || { rm -f "$tmp"; return 1; }
+
+  # Check if cert is valid for at least 7 days
+  if openssl x509 -checkend 604800 -noout -in "$tmp" >/dev/null 2>&1; then
+    rm -f "$tmp"
+    return 0
+  else
+    rm -f "$tmp"
+    return 1
+  fi
+}
+
+apply_manifest_template() {
+  local template="$1"
+  local output=$(mktemp)
+
+  # Simple variable substitution
+  envsubst < "manifests/$template" > "$output"
+  kubectl apply -f "$output" || fail "Failed to apply $template"
+  rm -f "$output"
+}
+
+wait_for_certificate() {
+  local ns="$1" cert_name="$2" timeout="${3:-300}"
+
+  log "Waiting for certificate $cert_name to be ready (timeout ${timeout}s)..."
+
+  local start=$(date +%s)
+  local last_status=""
+  local check_count=0
+
+  while true; do
+    check_count=$((check_count + 1))
     local now=$(date +%s)
-    if [ $((now-start_ts)) -ge "$timeout_secs" ]; then
-      echo "ERROR: Not enough Ready pods in ${ns} for selector '${selector}' after ${timeout_secs}s (need ${min_ready}, have ${ready:-0})."
-      echo ">>> Pods snapshot:"
-      kubectl -n "$ns" get pods "${label_arg[@]}" -o wide || true
-      echo ">>> Recent events:"
-      kubectl -n "$ns" get events --sort-by=.lastTimestamp | tail -n 50 || true
-      exit 1
+    local elapsed=$((now - start))
+
+    # Check if certificate is ready
+    if kubectl -n "$ns" get certificate "$cert_name" -o jsonpath='{.status.conditions[?(@.type=="Ready")].status}' 2>/dev/null | grep -q "True"; then
+      log "Certificate $cert_name is ready"
+      return 0
     fi
+
+    # Show status every 30 seconds or on first check
+    if [ $((check_count % 6)) -eq 1 ]; then
+      echo ">>> Certificate status (${elapsed}s elapsed):"
+
+      # Show certificate conditions (with connectivity check)
+      local conditions
+      if kubectl cluster-info >/dev/null 2>&1; then
+        conditions=$(kubectl -n "$ns" get certificate "$cert_name" -o jsonpath='{.status.conditions[*].type}:{.status.conditions[*].status}:{.status.conditions[*].message}' 2>/dev/null || echo "")
+        if [ -n "$conditions" ]; then
+          echo "    Conditions: $conditions"
+        else
+          echo "    Conditions: (certificate not found or no status yet)"
+        fi
+      else
+        echo "    Conditions: (cluster connectivity issue - retrying...)"
+      fi
+
+      # Show any recent events
+      echo "    Recent events:"
+      kubectl get events -n "$ns" --field-selector involvedObject.name="$cert_name" --sort-by='.lastTimestamp' --no-headers 2>/dev/null | tail -3 | sed 's/^/      /' || echo "      (no events found)"
+
+      # Show certificate request status if exists
+      local cr_name
+      cr_name=$(kubectl -n "$ns" get certificate "$cert_name" -o jsonpath='{.spec.secretName}' 2>/dev/null)
+      if [ -n "$cr_name" ]; then
+        local cr_ready
+        cr_ready=$(kubectl -n "$ns" get certificaterequests -l "cert-manager.io/certificate-name=$cert_name" -o jsonpath='{.items[*].status.conditions[?(@.type=="Ready")].status}' 2>/dev/null || echo "")
+        if [ -n "$cr_ready" ]; then
+          echo "    Certificate Request: $cr_ready"
+        fi
+      fi
+      echo
+    fi
+
+    # Check timeout
+    if [ "$elapsed" -ge "$timeout" ]; then
+      echo ">>> Certificate creation failed. Full details:"
+      kubectl -n "$ns" describe certificate "$cert_name" || true
+      echo ">>> Related events:"
+      kubectl get events -n "$ns" --field-selector involvedObject.name="$cert_name" --sort-by='.lastTimestamp' || true
+      fail "Certificate $cert_name not ready after ${timeout}s"
+    fi
+
     sleep 5
   done
 }
 
-# --- Teardown Cleanup Helpers ---
+configure_ssl() {
+  check_cloudflare_config
 
-prompt_yes_no() {
-  local prompt="$1"; shift || true
-  local default_answer="$1"; shift || true
-  local answer
-  read -r -p "$prompt ${default_answer:+[$default_answer]} " answer || true
-  answer=${answer:-$default_answer}
-  case "$answer" in
-    y|Y|yes|YES) return 0;;
-    *) return 1;;
-  esac
-}
+  # Ensure kubectl is working and cluster is accessible
+  log "Verifying cluster connectivity..."
+  kubectl cluster-info >/dev/null 2>&1 || fail "Cluster is not accessible. Check kubectl configuration."
 
-cleanup_docker() {
-  local prune_volumes_flag="$1"; shift || true
-  # Determine whether we need sudo for Docker
-  local DOCKER_CMD="docker"
-  if ! docker info >/dev/null 2>&1; then
-    if command -v sudo >/dev/null 2>&1 && sudo -n true >/dev/null 2>&1 && sudo -n docker info >/dev/null 2>&1; then
-      DOCKER_CMD="sudo docker"
-      echo ">>> Using sudo for Docker commands."
-    fi
+  # Ensure istio-system namespace exists (should be created by Istio installation)
+  log "Verifying istio-system namespace exists..."
+  kubectl get namespace istio-system >/dev/null 2>&1 || \
+    fail "istio-system namespace not found. Istio must be installed first."
+
+  log "Creating Cloudflare credentials secret..."
+  kubectl create secret generic cloudflare-api-token-secret -n cert-manager \
+    --from-literal=api-token="$CLOUDFLARE_API_TOKEN" --dry-run=client -o yaml | kubectl apply -f - || \
+    fail "Failed to create Cloudflare credentials"
+
+  log "Applying ClusterIssuers..."
+  apply_manifest_template "cluster-issuers-template.yaml"
+
+  # Wait for issuer to be ready
+  local issuer_name="letsencrypt-staging"
+  if [ "$USE_PROD_CERTS" = "true" ]; then
+    issuer_name="letsencrypt-prod"
   fi
 
-  echo ">>> Docker disk usage before cleanup:"
-  ${DOCKER_CMD} system df || true
+  log "Waiting for ClusterIssuer $issuer_name to be ready..."
+  kubectl wait --for=condition=Ready "clusterissuer/$issuer_name" --timeout=120s || \
+    fail "ClusterIssuer $issuer_name not ready"
 
-  echo ">>> Pruning stopped containers, dangling images, and unused networks..."
-  ${DOCKER_CMD} system prune -af || true
+  # Check if we can reuse existing certificate (in cluster or from backup)
+  local cert_name="${DETECTED_ENV}-wildcard-cert"
+  local tls_secret="${DETECTED_ENV}-wildcard-tls"
 
-  if [ "$prune_volumes_flag" = "true" ]; then
-    echo ">>> Pruning unused Docker volumes (aggressive) ..."
-    ${DOCKER_CMD} volume prune -f || true
-  fi
-
-  # Optionally remove Rancher images explicitly if still present
-  if ${DOCKER_CMD} images 'rancher/rancher*' -q | grep -q .; then
-    echo ">>> Removing Rancher images..."
-    ${DOCKER_CMD} images 'rancher/rancher*' -q | xargs -r ${DOCKER_CMD} rmi -f || true
-  fi
-
-  echo ">>> Docker disk usage after cleanup:"
-  ${DOCKER_CMD} system df || true
-}
-
-# --- General Cleanup Command ---
-
-cleanup() {
-  echo ">>> Cleanup helper"
-  echo "This will prune Docker images, containers, and networks."
-  echo "Optionally, it can also prune unused Docker volumes (more aggressive)."
-
-  if [ "$AUTO_DOCKER_PRUNE" = "true" ]; then
-    cleanup_docker "$PRUNE_DOCKER_VOLUMES"
-  else
-    if prompt_yes_no ">>> Run Docker prune to free space now?" "y"; then
-      local prune_vols="false"
-      if prompt_yes_no ">>> Also prune volumes?" "n"; then
-        prune_vols="true"
-      fi
-      cleanup_docker "$prune_vols"
-    else
-      echo ">>> Skipped Docker prune."
-    fi
-  fi
-
-  echo
-  echo "Additionally, you may purge Rancher data at '$RANCHER_DIR'."
-  cleanup_rancher_fs
-}
-
-# --- Rancher filesystem cleanup (/var/lib/rancher) ---
-
-_need_sudo_for_path() {
-  local path="$1"
-  [ -w "$path" ] && echo "" && return 0
-  if command -v sudo >/dev/null 2>&1; then
-    echo "sudo"
+  # First check if certificate exists in cluster and is valid
+  if cert_is_valid "istio-system" "$tls_secret"; then
+    log "Reusing valid certificate from cluster: $tls_secret"
+    # Backup existing certificate in case cluster gets reset
+    backup_certificate "istio-system" "$tls_secret"
     return 0
   fi
-  echo "" # fallback, may fail without sudo
-}
 
-_show_dir_size() {
-  local path="$1"
-  local SUDO="$(_need_sudo_for_path "$path")"
-  ${SUDO} du -sh "$path" 2>/dev/null || echo "(no access to size for $path)"
-}
-
-cleanup_rancher_fs() {
-  local path="${RANCHER_DIR}"
-  if [ ! -d "$path" ]; then
-    echo ">>> Rancher directory '$path' not found; skipping."
-    return
-  fi
-
-  echo ">>> Rancher dir before cleanup: $path"
-  _show_dir_size "$path"
-
-  local proceed="false"
-  if [ "$AUTO_RANCHER_PURGE" = "true" ]; then
-    proceed="true"
-  else
-    echo "WARNING: This will delete contents under '$path'."
-    echo "         Do this only if you don't need any Rancher/k3s data on this host."
-    if prompt_yes_no ">>> Purge contents of $path now?" "n"; then
-      proceed="true"
+  # If not in cluster, try to restore from backup
+  if cert_is_valid_from_backup "istio-system" "$tls_secret"; then
+    if restore_certificate "istio-system" "$tls_secret"; then
+      log "Reusing valid certificate from backup: $tls_secret"
+      return 0
     fi
   fi
 
-  if [ "$proceed" = "true" ]; then
-    local SUDO="$(_need_sudo_for_path "$path")"
-    echo ">>> Purging contents of $path ..."
-    # Remove all children but not the directory itself; handles dotfiles safely
-    ${SUDO} find "$path" -mindepth 1 -maxdepth 1 -exec rm -rf {} + 2>/dev/null || true
-    sync || true
-    echo ">>> Rancher dir after cleanup:"
-    _show_dir_size "$path"
-  else
-    echo ">>> Skipped purging $path."
+  log "Requesting new wildcard certificate for *.${K3S_INGRESS_DOMAIN}..."
+
+  # Validate domain is configured
+  if [ -z "$K3S_INGRESS_DOMAIN" ]; then
+    fail "K3S_INGRESS_DOMAIN is not set. Please configure it in config/compliance-lab.${DETECTED_ENV}"
   fi
+
+  log "Creating certificate for domain: $K3S_INGRESS_DOMAIN"
+
+  # Set issuer for certificate
+  export SSL_ISSUER_NAME="letsencrypt-staging"
+  if [ "$USE_PROD_CERTS" = "true" ]; then
+    export SSL_ISSUER_NAME="letsencrypt-prod"
+  fi
+
+  export CERT_NAME="$cert_name"
+  export TLS_SECRET_NAME="$tls_secret"
+
+  apply_manifest_template "wildcard-certificate-template.yaml"
+  wait_for_certificate "istio-system" "$cert_name" 600
+
+  # Back up the newly created certificate for future cluster resets
+  backup_certificate "istio-system" "$tls_secret"
 }
 
-# --- Rancher Container Management ---
+configure_networking() {
+  log "Configuring Istio Gateway and basic networking..."
 
-rancher_up() {
-  echo ">>> Starting Rancher container..."
-  if [ "$(docker ps -q -f name=^/${RANCHER_NAME}$)" ]; then
-    echo "Rancher container is already running."
-    echo "Access it at: ${RANCHER_URL:-https://localhost:8443}"
-    return
-  fi
-  if [ "$(docker ps -aq -f status=exited -f name=^/${RANCHER_NAME}$)" ]; then
-    echo "Removing existing stopped Rancher container."
-    docker rm "$RANCHER_NAME"
-  fi
+  export GATEWAY_NAME="${DETECTED_ENV}-wildcard-gateway"
+  export TLS_SECRET_NAME="${DETECTED_ENV}-wildcard-tls"
 
-  echo "Starting new Rancher container named '$RANCHER_NAME'..."
-  docker run -d --restart=unless-stopped \
-    -p 8080:80 -p 8443:443 \
-    -v "${CERT_FILE}":/etc/rancher/ssl/cert.pem:ro \
-    -v "${KEY_FILE}":/etc/rancher/ssl/key.pem:ro \
-    -v "${CA_FILE}":/etc/rancher/ssl/cacerts.pem:ro \
-    --privileged \
-    --name "$RANCHER_NAME" \
-    rancher/rancher:latest
+  # Create keycloak namespace before applying VirtualService
+  kubectl create namespace keycloak || true
 
-  echo "Rancher container started. It may take a few minutes to become available."
-  echo "Access it at: ${RANCHER_URL:-https://localhost:8443}"
+  apply_manifest_template "istio-gateway-template.yaml"
+  apply_manifest_template "keycloak-virtualservice-template.yaml"
 }
 
-rancher_down() {
-  echo ">>> Stopping and removing Rancher container..."
-  if [ ! "$(docker ps -aq -f name=^/${RANCHER_NAME}$)" ]; then
-    echo "Rancher container not found."
-    return
-  fi
-  docker stop "$RANCHER_NAME"
-  docker rm "$RANCHER_NAME"
-  echo "Rancher container removed."
+configure_service_routing() {
+  log "Configuring service routing..."
 
-  # Optional cleanup
-  if [ "$AUTO_DOCKER_PRUNE" = "true" ]; then
-    cleanup_docker "$PRUNE_DOCKER_VOLUMES"
-  else
-    if prompt_yes_no ">>> Run Docker prune to free space now?" "n"; then
-      cleanup_docker "$(prompt_yes_no ">>> Also prune volumes?" "n" && echo true || echo false)"
-    fi
-  fi
-
-  # Optional Rancher filesystem purge
-  cleanup_rancher_fs
+  # Apply VirtualServices for services that are now deployed
+  apply_manifest_template "monitoring-virtualservices-template.yaml"
+  apply_manifest_template "minio-virtualservice-template.yaml"
+  apply_manifest_template "compliance-test-virtualservice-template.yaml"
 }
 
-rancher_reset() {
-  rancher_down
-  rancher_up
-}
-
-# --- K3s Cluster Management ---
-
-register_cluster() {
-  check_config
-  echo ">>> Registering cluster with Rancher..."
-
-  ensure_rancher_available
-
-  echo ">>> Validating Rancher API and token..."
-  STATUS=$(curl -s -k -o /dev/null -w "%{http_code}" -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" "${RANCHER_URL}/v3" || true)
-  if [ "$STATUS" != "200" ]; then
-    echo "ERROR: Rancher API not reachable or token invalid. HTTP ${STATUS}"
-    echo "Hint: re-run './compliance-lab.sh configure' or check RANCHER_URL in rancher.env"
-    exit 1
-  fi
-
-  echo "Creating cluster in Rancher..."
-  TMPRESP=$(mktemp)
-  HTTP_STATUS=$(curl -s -k -o "$TMPRESP" -w "%{http_code}" -X POST "${RANCHER_URL}/v3/clusters" \
-    -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" \
-    -H 'Content-Type: application/json' \
-    -d "{\"type\":\"cluster\",\"name\":\"${CLUSTER_NAME}\"}")
-  CLUSTER_ID=$(cat "$TMPRESP" | jq -r '.id // empty')
-
-  if [ "$HTTP_STATUS" -lt 200 ] || [ "$HTTP_STATUS" -ge 300 ] || [ -z "$CLUSTER_ID" ]; then
-    echo "ERROR: Failed to create cluster in Rancher. HTTP ${HTTP_STATUS}"
-    echo "Response: $(cat "$TMPRESP" | jq -c '.')"
-    rm -f "$TMPRESP"
-    exit 1
-  fi
-  rm -f "$TMPRESP"
-  echo "Cluster object created with ID: ${CLUSTER_ID}"
-
-  echo "Waiting for cluster object to be ready in Rancher..."
-  for i in $(seq 1 12); do
-    CLUSTER_STATE=$(curl -s -k -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" "${RANCHER_URL}/v3/clusters/${CLUSTER_ID}" | jq -r '.state // empty')
-    if [ "$CLUSTER_STATE" != "provisioning" ] && [ -n "$CLUSTER_STATE" ]; then
-      echo "Cluster state is now '${CLUSTER_STATE}'. Proceeding."
-      break
-    fi
-    if [ $i -eq 12 ]; then
-       echo "ERROR: Cluster '${CLUSTER_NAME}' did not become ready in Rancher after 60s."
-       exit 1
-    fi
-    echo "Waiting for cluster to finish provisioning... (${i}/12)"
-    sleep 5
-  done
-
-  echo "Generating registration token..."
-  # Create a token resource, then poll until manifestUrl is populated
-  TMP_TOKEN_RESP=$(mktemp)
-  TOKEN_HTTP=$(curl -s -k -o "$TMP_TOKEN_RESP" -w "%{http_code}" -X POST "${RANCHER_URL}/v3/clusterregistrationtokens" \
-    -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" \
-    -H 'Content-Type: application/json' \
-    -d "{\"type\":\"clusterRegistrationToken\",\"clusterId\":\"${CLUSTER_ID}\"}")
-  if [ "$TOKEN_HTTP" -lt 200 ] || [ "$TOKEN_HTTP" -ge 300 ]; then
-    echo "ERROR: Failed to create cluster registration token. HTTP ${TOKEN_HTTP}"
-    echo "Response: $(cat "$TMP_TOKEN_RESP" | jq -c '.')"
-    rm -f "$TMP_TOKEN_RESP"
-    exit 1
-  fi
-  TOKEN_ID=$(cat "$TMP_TOKEN_RESP" | jq -r '.id // empty')
-  rm -f "$TMP_TOKEN_RESP"
-
-  # Poll for manifestUrl up to 5 minutes
-  MANIFEST_URL=""
-  for i in $(seq 1 60); do
-    # Try by ID first if we have it
-    if [ -n "$TOKEN_ID" ]; then
-      POLL_JSON=$(curl -s -k -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" "${RANCHER_URL}/v3/clusterregistrationtokens/${TOKEN_ID}")
-      MANIFEST_URL=$(echo "$POLL_JSON" | jq -r '.manifestUrl // empty')
-    fi
-    # Fallback: list tokens by clusterId and take the first with manifestUrl
-    if [ -z "$MANIFEST_URL" ]; then
-      LIST_JSON=$(curl -s -k -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" "${RANCHER_URL}/v3/clusterregistrationtokens?clusterId=${CLUSTER_ID}")
-      MANIFEST_URL=$(echo "$LIST_JSON" | jq -r '.data[] | select(.manifestUrl != null) | .manifestUrl' | head -n1)
-    fi
-
-    if [ -n "$MANIFEST_URL" ]; then
-      break
-    fi
-    echo "Waiting for manifest URL... (${i}/60)"
-    sleep 5
-  done
-
-  if [ -z "$MANIFEST_URL" ]; then
-    echo "ERROR: Failed to generate registration token (manifestUrl not ready)."
-    exit 1
-  fi
-  echo "Registration manifest URL obtained."
-
-  echo "Applying registration manifest to cluster..."
-  # Some environments use a private CA for Rancher; download with -k and pipe to kubectl
-  if ! curl -skL "${MANIFEST_URL}" | kubectl apply -f -; then
-    echo "ERROR: Failed to apply registration manifest."
-    echo "Tried to fetch with TLS skip-verify due to potential private CA."
-    echo "Manifest URL: ${MANIFEST_URL}"
-    exit 1
-  fi
-  echo "Cluster registration initiated. It may take a few minutes for the cluster to become active in Rancher."
-}
-
-deregister_cluster() {
-  check_config
-  echo ">>> Deregistering cluster from Rancher..."
-
-  echo "Finding cluster ID for '${CLUSTER_NAME}'..."
-  CLUSTER_ID=$(curl -s -k -X GET "${RANCHER_URL}/v3/clusters?name=${CLUSTER_NAME}" \
-    -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" \
-    -H 'Content-Type: application/json' | jq -r '.data[0].id')
-
-  if [ -z "$CLUSTER_ID" ] || [ "$CLUSTER_ID" == "null" ]; then
-    echo "WARNING: Cluster '${CLUSTER_NAME}' not found in Rancher. Skipping."
-    return
-  fi
-  echo "Found cluster ID: ${CLUSTER_ID}"
-
-  echo "Deleting cluster from Rancher..."
-  DELETE_STATUS=$(curl -s -k -X DELETE "${RANCHER_URL}/v3/clusters/${CLUSTER_ID}" \
-    -H "Authorization: Bearer ${RANCHER_BEARER_TOKEN}" \
-    -o /dev/null -w "%{http_code}")
-
-  if [ "$DELETE_STATUS" -ge 200 ] && [ "$DELETE_STATUS" -lt 300 ]; then
-    echo "Cluster deregistration successful."
-  else
-    echo "WARNING: Failed to deregister cluster from Rancher. HTTP status: ${DELETE_STATUS}"
-  fi
-}
+# --- Main Functions ---
 
 create_cluster() {
-  echo ">>> Creating k3d cluster: $CLUSTER_NAME"
-  k3d cluster create "$CLUSTER_NAME" --agents 1 --port '80:80@loadbalancer' --port '443:443@loadbalancer' --k3s-arg "--disable=traefik@server:0" --wait
+  log "Creating k3s cluster: $CLUSTER_NAME"
+  log "Environment: $DETECTED_ENV"
+  log "Domain: $K3S_INGRESS_DOMAIN"
+  log "Certificates: $([ "$USE_PROD_CERTS" = "true" ] && echo "Production" || echo "Staging")"
+
+  # Create k3d cluster
+  k3d cluster create "$CLUSTER_NAME" \
+    --agents 1 \
+    --port '80:80@loadbalancer' \
+    --port '443:443@loadbalancer' \
+    --k3s-arg "--disable=traefik@server:0" \
+    --wait || fail "Failed to create k3d cluster"
+
   export KUBECONFIG=$(k3d kubeconfig write "$CLUSTER_NAME")
 
-  echo ">>> Installing OpenEBS LocalPV Hostpath..."
+  # Install storage
+  log "Installing OpenEBS LocalPV..."
   kubectl apply -f https://raw.githubusercontent.com/openebs/dynamic-localpv-provisioner/develop/deploy/kubectl/openebs-operator-lite.yaml
-  # Wait for the LocalPV provisioner to be ready before creating the StorageClass
-  kubectl wait --for=condition=available --timeout=300s deployment/openebs-localpv-provisioner -n openebs || true
+  kubectl wait --for=condition=available --timeout=300s deployment/openebs-localpv-provisioner -n openebs || \
+    fail "OpenEBS installation failed"
 
-  echo ">>> Creating OpenEBS hostpath StorageClass..."
-  kubectl apply -f - <<EOF
-apiVersion: storage.k8s.io/v1
-kind: StorageClass
-metadata:
-  name: openebs-hostpath
-  annotations:
-    storageclass.kubernetes.io/is-default-class: "true"
-provisioner: openebs.io/local
-parameters:
-  StorageType: "hostpath"
-  BasePath: "/var/openebs/local"
-allowVolumeExpansion: true
-volumeBindingMode: WaitForFirstConsumer
-reclaimPolicy: Delete
-EOF
+  kubectl apply -f manifests/openebs-storageclass.yaml || fail "Failed to create StorageClass"
 
-  echo ">>> Installing cert-manager..."
-  CERT_MANAGER_URL="https://github.com/cert-manager/cert-manager/releases/download/v1.13.0/cert-manager.yaml"
-  : <<'LEGACY_SED'
-  # removed: legacy sed-based patch of cert-manager manifest
-  # removed: old sed args injection
-  # removed
-  sed '/name: cert-manager-controller/,$!b;/args:/a\        - --dns01-recursive-nameservers-only\
-        - --dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53
-' | kubectl apply -f -
-  kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager
-LEGACY_SED
-  # Apply upstream manifest as-is to avoid YAML injection pitfalls
-  kubectl apply -f "$CERT_MANAGER_URL"
-  # Ensure webhook is up before patching controller args
-  kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager || true
-  # Safety net: ensure cert-manager controller has Leases RBAC in its namespace for leader election
-  # Some environments lack these Role/RoleBinding after customizations; this manifest is idempotent
-  kubectl apply -f manifests/cert-manager-leader-rbac.yaml || true
-  # Ensure critical default args are present on the controller (avoids stale misconfig from prior runs)
-  echo ">>> Verifying cert-manager controller default args..."
-  for i in $(seq 1 60); do
-    kubectl -n cert-manager get deploy cert-manager >/dev/null 2>&1 && break
-    sleep 2
-  done
-  # Make sure args array exists
-  if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0] | has("args")' >/dev/null 2>&1; then
-    kubectl -n cert-manager patch deployment cert-manager --type=json \
-      -p '[{"op":"add","path":"/spec/template/spec/containers/0/args","value":[]}]' || true
-  fi
-  # Append leader/namespace defaults if missing
-  if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--leader-election-namespace=$(POD_NAMESPACE)")' >/dev/null 2>&1; then
-    kubectl -n cert-manager patch deployment cert-manager --type=json \
-      -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--leader-election-namespace=$(POD_NAMESPACE)"}]' || true
-  fi
-  if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--cluster-resource-namespace=$(POD_NAMESPACE)")' >/dev/null 2>&1; then
-    kubectl -n cert-manager patch deployment cert-manager --type=json \
-      -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--cluster-resource-namespace=$(POD_NAMESPACE)"}]' || true
-  fi
-  # Show args and restart to pick up patches
-  echo ">>> cert-manager controller args:"
-  kubectl -n cert-manager get deploy cert-manager -o jsonpath='{.spec.template.spec.containers[0].args}' || true
-  echo
-  kubectl -n cert-manager rollout restart deploy/cert-manager || true
-  kubectl -n cert-manager rollout status deploy/cert-manager --timeout=300s || true
-  if [ "${USE_DNS_PUBLIC_RESOLVERS:-false}" = "true" ]; then
-    echo ">>> Enabling cert-manager public DNS resolvers (idempotent append)..."
-    # Wait for the cert-manager deployment object to be created
-    for i in $(seq 1 60); do
-      if kubectl -n cert-manager get deploy cert-manager >/dev/null 2>&1; then
-        break
-      fi
-      sleep 2
-    done
-    # Ensure the args array exists to safely append values later
-    if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0] | has("args")' >/dev/null 2>&1; then
-      kubectl -n cert-manager patch deployment cert-manager --type=json \
-        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args","value":[]}]' || true
-    fi
-    # Append flags only if they are not already present
-    if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--dns01-recursive-nameservers-only")' >/dev/null 2>&1; then
-      kubectl -n cert-manager patch deployment cert-manager --type=json \
-        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--dns01-recursive-nameservers-only"}]' || true
-    fi
-    if ! kubectl -n cert-manager get deploy cert-manager -o json | jq -e '.spec.template.spec.containers[0].args // [] | index("--dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53")' >/dev/null 2>&1; then
-      kubectl -n cert-manager patch deployment cert-manager --type=json \
-        -p '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53"}]' || true
-    fi
-    # Show effective args for verification
-    echo ">>> cert-manager controller args:"
-    kubectl -n cert-manager get deploy cert-manager -o jsonpath='{.spec.template.spec.containers[0].args}' || true
-    echo
-  else
-    echo ">>> Skipping cert-manager DNS resolver flags (USE_DNS_PUBLIC_RESOLVERS=false)"
-  fi
-  # removed stray fi from legacy block
+  # Install cert-manager
+  log "Installing cert-manager..."
+  kubectl apply -f https://github.com/cert-manager/cert-manager/releases/download/v1.18.2/cert-manager.yaml
+  kubectl wait --for=condition=available --timeout=300s deployment/cert-manager-webhook -n cert-manager || \
+    fail "cert-manager installation failed"
 
-  echo ">>> Configuring SSL certificates with Let's Encrypt and Cloudflare..."
-  if [ -z "${CLOUDFLARE_API_TOKEN:-}" ] || [ -z "${CLOUDFLARE_EMAIL:-}" ] || [ -z "${CLOUDFLARE_ZONE_ID:-}" ]; then
-    if [ "$REQUIRE_SSL" = "true" ]; then
-      echo "ERROR: Cloudflare credentials (API Token, Email, Zone ID) not configured and REQUIRE_SSL=true"
-      echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
-      exit 1
-    else
-      echo "WARNING: Cloudflare credentials (API Token, Email, Zone ID) not configured. SSL certificates will not be automatically issued."
-      echo "Run './compliance-lab.sh configure' to set up Cloudflare integration."
-    fi
-  else
-    # Validate Cloudflare credentials before proceeding
-    if ! validate_cloudflare_credentials "${CLOUDFLARE_EMAIL}" "${CLOUDFLARE_API_TOKEN}" "${CLOUDFLARE_ZONE_ID}"; then
-      if [ "$REQUIRE_SSL" = "true" ]; then
-        echo "ERROR: Cloudflare credential validation failed and REQUIRE_SSL=true"
-        exit 1
-      else
-        echo "WARNING: Cloudflare credential validation failed. Continuing without SSL setup."
-        echo "Fix your credentials and run './compliance-lab.sh configure' to retry."
-      fi
-    else
-      echo ">>> Creating Cloudflare credentials secret..."
-      if ! kubectl create secret generic cloudflare-api-token-secret -n cert-manager \
-        --from-literal=api-token="${CLOUDFLARE_API_TOKEN}" --dry-run=client -o yaml | kubectl apply -f -; then
-        echo "ERROR: Failed to create Cloudflare credentials secret"
-        if [ "$REQUIRE_SSL" = "true" ]; then
-          cleanup_failed_ssl_setup
-          exit 1
-        else
-          echo "WARNING: Continuing without SSL setup"
-        fi
-      else
-          echo ">>> Applying ClusterIssuer manifest..."
-        # Create temporary file to debug YAML structure
-        TEMP_MANIFEST=$(mktemp)
-        cat > "$TEMP_MANIFEST" <<EOF
----
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-staging
-spec:
-  acme:
-    server: https://acme-staging-v02.api.letsencrypt.org/directory
-    email: "${CLOUDFLARE_EMAIL}"
-    privateKeySecretRef:
-      name: letsencrypt-staging
-    solvers:
-    - dns01:
-        cloudflare:
-          apiTokenSecretRef:
-            name: cloudflare-api-token-secret
-            key: api-token
----
-apiVersion: cert-manager.io/v1
-kind: ClusterIssuer
-metadata:
-  name: letsencrypt-prod
-spec:
-  acme:
-    server: https://acme-v02.api.letsencrypt.org/directory
-    email: "${CLOUDFLARE_EMAIL}"
-    privateKeySecretRef:
-      name: letsencrypt-prod
-    solvers:
-    - dns01:
-        cloudflare:
-          apiTokenSecretRef:
-            name: cloudflare-api-token-secret
-            key: api-token
-EOF
-        echo ">>> Generated ClusterIssuer manifest:"
-        cat "$TEMP_MANIFEST"
-        echo ">>> Applying manifest..."
-        if ! kubectl apply -f "$TEMP_MANIFEST"; then
-          echo "ERROR: Failed to apply ClusterIssuer manifest"
-          rm -f "$TEMP_MANIFEST"
-          if [ "$REQUIRE_SSL" = "true" ]; then
-            cleanup_failed_ssl_setup
-            exit 1
-          else
-            echo "WARNING: Continuing without SSL setup"
-          fi
-        else
-          # Wait for the issuer that will be used (staging if USE_STAGING_SSL=true, else prod)
-          local WAIT_ISSUER_NAME="letsencrypt-prod"
-          if [ "$USE_STAGING_SSL" = "true" ]; then
-            WAIT_ISSUER_NAME="letsencrypt-staging"
-          fi
-          echo "Waiting for ClusterIssuer '${WAIT_ISSUER_NAME}' to be ready..."
-          if ! kubectl wait --for=condition=Ready clusterissuer/${WAIT_ISSUER_NAME} --timeout=300s; then
-            echo "ERROR: ClusterIssuer '${WAIT_ISSUER_NAME}' did not become ready within 5 minutes"
-            echo ">>> Describe '${WAIT_ISSUER_NAME}':"
-            kubectl describe clusterissuer ${WAIT_ISSUER_NAME} || true
-            echo ">>> cert-manager controller logs (last 200 lines):"
-            kubectl -n cert-manager logs deploy/cert-manager --tail=200 || true
-            if [ "$REQUIRE_SSL" = "true" ]; then
-              cleanup_failed_ssl_setup
-              exit 1
-            else
-              echo "WARNING: SSL setup may not work properly. Continuing anyway."
-            fi
-          else
-            echo "Cloudflare ClusterIssuer '${WAIT_ISSUER_NAME}' is Ready. Wildcard certificate will be applied after Istio installation."
-          fi
-        fi
-      fi
-    fi
-  fi
+  # Configure cert-manager to use external DNS servers for propagation checks
+  log "Configuring cert-manager DNS settings..."
+  kubectl patch deployment cert-manager -n cert-manager --type='json' -p='[
+    {
+      "op": "replace",
+      "path": "/spec/template/spec/containers/0/args",
+      "value": [
+        "--v=2",
+        "--cluster-resource-namespace=$(POD_NAMESPACE)",
+        "--leader-election-namespace=kube-system",
+        "--acme-http01-solver-image=quay.io/jetstack/cert-manager-acmesolver:v1.13.0",
+        "--max-concurrent-challenges=60",
+        "--dns01-recursive-nameservers=1.1.1.1:53,8.8.8.8:53",
+        "--dns01-recursive-nameservers-only"
+      ]
+    }
+  ]'
+  kubectl rollout status deployment/cert-manager -n cert-manager || \
+    fail "cert-manager DNS configuration failed"
 
-  echo ">>> Installing MinIO (single instance)..."
+  # Install Istio
+  log "Installing Istio..."
+  istioctl install --set profile=demo -y || fail "Istio installation failed"
+  kubectl -n istio-system rollout status deploy/istiod --timeout=300s || fail "Istio rollout failed"
+
+  # Configure SSL certificates (after Istio creates istio-system namespace)
+  configure_ssl
+
+  # Configure networking
+  configure_networking
+
+  # Install other components
+  install_components
+
+  # Configure service routing now that all services are deployed
+  configure_service_routing
+
+  log "Cluster ready!"
+  show_cluster_info
+}
+
+install_components() {
+  log "Installing MinIO..."
   kubectl create ns minio || true
   helm repo add minio https://charts.min.io/ || true
   helm upgrade --install minio minio/minio -n minio \
     --set mode=standalone \
     --set replicas=1 \
-    --set auth.rootUser=${MINIO_ACCESS_KEY} \
-    --set auth.rootPassword=${MINIO_SECRET_KEY} \
+    --set auth.rootUser=myaccesskey \
+    --set auth.rootPassword=mysecretkey \
     --set defaultBuckets="velero" \
-    --set persistence.enabled=true \
-    --set persistence.size=5Gi \
     --set resources.requests.memory=512Mi \
-    --set resources.requests.cpu=250m
-  kubectl wait --for=condition=available --timeout=300s deployment/minio -n minio || true
-  kubectl wait --for=condition=ready --timeout=300s pod -l app=minio -n minio || true
+    --set resources.limits.memory=1Gi \
+    --wait --timeout=300s || fail "MinIO installation failed"
 
-  echo ">>> Installing Velero..."
-  # Ensure MinIO credentials file exists for Velero's AWS plugin
+  log "Installing Velero..."
   mkdir -p ./manifests
-  if [ ! -f ./manifests/minio-credentials ]; then
-    cat > ./manifests/minio-credentials <<EOF
+  cat > ./manifests/minio-credentials <<EOF
 [default]
-aws_access_key_id = ${MINIO_ACCESS_KEY}
-aws_secret_access_key = ${MINIO_SECRET_KEY}
+aws_access_key_id = myaccesskey
+aws_secret_access_key = mysecretkey
 EOF
-    chmod 600 ./manifests/minio-credentials || true
-  fi
   velero install \
     --provider aws \
     --plugins velero/velero-plugin-for-aws:v1.8.0 \
     --bucket velero \
     --secret-file ./manifests/minio-credentials \
     --use-volume-snapshots=false \
-    --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000 || true
+    --backup-location-config region=minio,s3ForcePathStyle=true,s3Url=http://minio.minio.svc.cluster.local:9000 || \
+    fail "Velero installation failed"
 
-  echo ">>> Prechecking Istio..."
-  istioctl x precheck || true
-
-  echo ">>> Installing Istio (tuned for k3d)..."
-  cat <<'EOF' | istioctl install -y -f -
-apiVersion: install.istio.io/v1alpha1
-kind: IstioOperator
-spec:
-  profile: demo
-  components:
-    pilot:
-      k8s:
-        resources:
-          requests:
-            cpu: 100m
-            memory: 256Mi
-    ingressGateways:
-    - name: istio-ingressgateway
-      enabled: true
-      k8s:
-        resources:
-          requests:
-            cpu: 50m
-            memory: 128Mi
-        hpaSpec:
-          minReplicas: 1
-          maxReplicas: 1
-    egressGateways:
-    - name: istio-egressgateway
-      enabled: true
-      k8s:
-        resources:
-          requests:
-            cpu: 50m
-            memory: 128Mi
-        hpaSpec:
-          minReplicas: 1
-          maxReplicas: 1
-EOF
-
-  echo ">>> Waiting for Istio control plane and gateways..."
-  kubectl -n istio-system rollout status deploy/istiod --timeout=600s || true
-  kubectl -n istio-system rollout status deploy/istio-ingressgateway --timeout=600s || true
-  kubectl -n istio-system rollout status deploy/istio-egressgateway --timeout=600s || true
-
-  echo ">>> Configuring Istio Gateway for SSL termination..."
-  kubectl apply -f manifests/istio-gateway.yaml
-
-  # Apply or reuse wildcard certificate now that istio-system namespace exists
-  if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL" ]; then
-    local reuse_ok="false"
-    if [ "$REUSE_EXISTING_CERTS" = "true" ]; then
-      # Try to restore backups and check validity
-      restore_cert_artifacts || true
-      local days_left
-      days_left=$(cert_days_remaining istio-system dev-wildcard-tls)
-      # Prefer reuse unless the cert is actually expired; MIN_CERT_VALID_DAYS > 0 enables optional early rotation
-      if cert_is_expired istio-system dev-wildcard-tls; then
-        echo ">>> Existing TLS secret is expired (or missing). Proceeding to (re)issue."
-      else
-        if [ "$MIN_CERT_VALID_DAYS" -gt 0 ] && [ "${days_left:-0}" -lt "$MIN_CERT_VALID_DAYS" ]; then
-          echo ">>> TLS secret is valid but below early-rotation threshold (${days_left}d < ${MIN_CERT_VALID_DAYS}d). Proceeding to renew."
-        else
-          echo ">>> Reusing existing TLS secret (istio-system/dev-wildcard-tls), ${days_left} day(s) remaining. Skipping issuance."
-          reuse_ok="true"
-        fi
-      fi
-    fi
-
-    if [ "$reuse_ok" != "true" ]; then
-      # Decide issuer (prod vs staging) for the Certificate
-      local SSL_ISSUER_NAME="letsencrypt-prod"
-      if [ "$USE_STAGING_SSL" = "true" ]; then
-        SSL_ISSUER_NAME="letsencrypt-staging"
-      fi
-      if [ "$FLUSH_COREDNS_ON_ISSUANCE" = "true" ]; then
-        echo ">>> Flushing CoreDNS cache (rollout restart) to avoid negative caching..."
-        kubectl -n kube-system rollout restart deploy coredns || true
-        kubectl -n kube-system rollout status deploy/coredns --timeout=120s || true
-      fi
-      if [ "$CLEANUP_ACME_DNS" = "true" ]; then
-        cleanup_acme_dns_records || true
-      fi
-      echo ">>> Requesting wildcard SSL certificate via '${SSL_ISSUER_NAME}' (SANs: *.${K3S_INGRESS_DOMAIN}, ${K3S_INGRESS_DOMAIN})..."
-      TMP_CERT_MANIFEST=$(mktemp)
-      cat > "$TMP_CERT_MANIFEST" <<EOF
-apiVersion: cert-manager.io/v1
-kind: Certificate
-metadata:
-  name: dev-wildcard-cert
-  namespace: istio-system
-spec:
-  secretName: dev-wildcard-tls
-  privateKey:
-    rotationPolicy: Never
-  issuerRef:
-    name: ${SSL_ISSUER_NAME}
-    kind: ClusterIssuer
-  commonName: "*.${K3S_INGRESS_DOMAIN}"
-  dnsNames:
-  - "*.${K3S_INGRESS_DOMAIN}"
-  - "${K3S_INGRESS_DOMAIN}"
-EOF
-      kubectl apply -f "$TMP_CERT_MANIFEST"
-      rm -f "$TMP_CERT_MANIFEST"
-      echo "Wildcard certificate requested. It may take a few minutes to be issued."
-      echo "Check status with: kubectl get certificate -n istio-system"
-      if [ "$WAIT_FOR_CERT_READY" = "true" ]; then
-        wait_for_certificate_ready "istio-system" "dev-wildcard-cert" 600
-      fi
-      # Backup artifacts after successful issuance or even if Ready wait is disabled
-      backup_cert_artifacts || true
-    fi
-  fi
-
-  echo ">>> Installing Keycloak..."
-  # Ensure namespace exists before applying resources into it
+  log "Installing Keycloak..."
   kubectl create namespace keycloak || true
-  helm repo add codecentric https://codecentric.github.io/helm-charts || true
-  # Use 'env' list instead of 'extraEnv' to satisfy chart schema
-  helm upgrade --install keycloak codecentric/keycloakx -n keycloak \
-    --set replicas=1 \
-    --set ingress.enabled=true \
-    --set ingress.hosts[0].host=keycloak.$K3S_INGRESS_DOMAIN \
-    --set ingress.hosts[0].paths[0].path=/ \
-    --set args='{start-dev}' \
-    --set env[0].name=KEYCLOAK_ADMIN --set env[0].value=admin \
-    --set env[1].name=KEYCLOAK_ADMIN_PASSWORD --set env[1].value=admin \
-    --set env[2].name=KC_HEALTH_ENABLED --set env[2].value=true
+  kubectl apply -f manifests/keycloak-deployment.yaml || fail "Keycloak installation failed"
 
-  echo ">>> Applying Keycloak VirtualService..."
-  kubectl apply -f manifests/keycloak-virtualservice.yaml || true
-  echo ">>> Adjusting Keycloak health probes for Quarkus distribution..."
-  # Patch the Keycloak StatefulSet probes to use modern endpoints and port 8080
-  for i in $(seq 1 60); do
-    if kubectl -n keycloak get statefulset keycloak-keycloakx >/dev/null 2>&1; then
-      break
-    fi
-    sleep 2
-  done
-  TMP_KC_PATCH=$(mktemp)
-  cat > "$TMP_KC_PATCH" <<'JSON'
-[
-  {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/httpGet/path","value":"/health/ready"},
-  {"op":"replace","path":"/spec/template/spec/containers/0/startupProbe/httpGet/port","value":8080},
-  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/path","value":"/health/ready"},
-  {"op":"replace","path":"/spec/template/spec/containers/0/readinessProbe/httpGet/port","value":8080},
-  {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/path","value":"/health/live"},
-  {"op":"replace","path":"/spec/template/spec/containers/0/livenessProbe/httpGet/port","value":8080}
-]
-JSON
-  kubectl -n keycloak patch statefulset keycloak-keycloakx --type=json -p "$(cat "$TMP_KC_PATCH")" || true
-  rm -f "$TMP_KC_PATCH" || true
-  kubectl -n keycloak rollout restart statefulset/keycloak-keycloakx || true
-  # Readiness gate: Keycloak
-  wait_for_pods_ready keycloak "app.kubernetes.io/instance=keycloak" 1 420
+  # Wait for Keycloak deployment to be ready
+  kubectl wait --for=condition=available --timeout=600s deployment/keycloak -n keycloak || \
+    fail "Keycloak deployment failed to become ready"
 
-  echo ">>> Installing Vault..."
-  helm repo add hashicorp https://helm.releases.hashicorp.com || true
-  helm upgrade --install vault hashicorp/vault -n vault --create-namespace \
-    --set server.dev.enabled=true || true
-
-  echo ">>> Installing ELK (minimal, tuned for k3d)..."
-  helm repo add elastic https://helm.elastic.co || true
-  check_node_pressure
-  ELASTIC_TOLERATIONS_ARGS=()
-  if [ "${NODE_DISK_PRESSURE}" = "true" ] && [ "${ALLOW_TAINTED_NODES:-}" = "true" ]; then
-    echo ">>> Allowing scheduling on DiskPressure nodes for Elasticsearch (override)."
-    ELASTIC_TOLERATIONS_ARGS+=(
-      --set tolerations[0].key=node.kubernetes.io/disk-pressure \
-      --set tolerations[0].operator=Exists \
-      --set tolerations[0].effect=NoSchedule
-    )
-  fi
-  helm upgrade --install elasticsearch elastic/elasticsearch -n elk --create-namespace \
-    --set replicas=1 \
-    --set resources.requests.cpu=200m \
-    --set resources.requests.memory=512Mi \
-    --set resources.limits.memory=1Gi \
-    --set esJavaOpts="-Xms512m -Xmx512m" \
-    --set persistence.enabled=false \
-    ${ELASTIC_TOLERATIONS_ARGS[@]} \
-    --wait --timeout 10m || true
-  helm upgrade --install kibana elastic/kibana -n elk \
-    --set replicas=1 \
-    --set resources.requests.cpu=100m \
-    --set resources.requests.memory=256Mi \
-    --wait --timeout 10m || true
-
-  echo ">>> Waiting for ELK pods to become Ready..."
-  # Readiness gates: Elasticsearch and Kibana
-  wait_for_pods_ready elk "app.kubernetes.io/name=elasticsearch,app.kubernetes.io/instance=elasticsearch" 1 600
-  wait_for_pods_ready elk "app.kubernetes.io/name=kibana,app.kubernetes.io/instance=kibana" 1 600
-
-  echo ">>> Installing Fluent Bit..."
-  helm repo add fluent https://fluent.github.io/helm-charts || true
-  helm upgrade --install fluent-bit fluent/fluent-bit -n logging --create-namespace \
-    --set backend.type=es \
-    --set backend.es.host=elasticsearch-master.elk.svc.cluster.local || true
-
-  echo ">>> Installing Prometheus Operator (minimal)..."
+  log "Installing monitoring stack..."
   helm repo add prometheus-community https://prometheus-community.github.io/helm-charts || true
   helm upgrade --install kube-prometheus-stack prometheus-community/kube-prometheus-stack -n monitoring --create-namespace \
     --set prometheus.prometheusSpec.replicas=1 \
     --set prometheus.prometheusSpec.resources.requests.cpu=250m \
     --set prometheus.prometheusSpec.resources.requests.memory=512Mi \
-    --set prometheus.prometheusSpec.retention=7d \
-    --set alertmanager.alertmanagerSpec.replicas=1 \
-    --set alertmanager.alertmanagerSpec.resources.requests.cpu=100m \
-    --set alertmanager.alertmanagerSpec.resources.requests.memory=128Mi \
+    --set prometheus.prometheusSpec.resources.limits.memory=1Gi \
+    --set prometheus.prometheusSpec.resources.limits.cpu=1000m \
     --set grafana.replicas=1 \
+    --set grafana.resources.requests.memory=128Mi \
     --set grafana.resources.requests.cpu=100m \
-    --set grafana.resources.requests.memory=128Mi || true
-  # Readiness gates: Grafana and Prometheus
-  wait_for_pods_ready monitoring "app.kubernetes.io/name=grafana,app.kubernetes.io/instance=kube-prometheus-stack" 1 600
-  wait_for_pods_ready monitoring "app.kubernetes.io/name=prometheus,app.kubernetes.io/instance=kube-prometheus-stack" 1 600
+    --set grafana.resources.limits.memory=256Mi \
+    --set grafana.resources.limits.cpu=500m \
+    --set alertmanager.alertmanagerSpec.resources.requests.memory=128Mi \
+    --set alertmanager.alertmanagerSpec.resources.limits.memory=256Mi \
+    --wait --timeout=600s || fail "Monitoring stack installation failed"
 
-  echo ">>> Applying compliance manifests..."
   kubectl apply -f manifests/compliance-system.yaml || true
   kubectl apply -f manifests/compliance-test.yaml || true
+}
 
-  echo ">>> Registering cluster with Rancher..."
-  register_cluster
-
-  echo ">>> Cluster ready!"
+show_cluster_info() {
   echo
-  echo "=== SSL Certificate Configuration ==="
-  if [ -n "$CLOUDFLARE_API_TOKEN" ] && [ -n "$CLOUDFLARE_EMAIL" ]; then
-    echo "✓ Wildcard SSL certificate configured for *.dev.butterflycluster.com"
-    echo "  Certificate will be stored as: istio-system/dev-wildcard-tls"
-    echo "  Check certificate status: kubectl get certificate -n istio-system"
-    echo
-    echo "📋 DNS Configuration Required:"
-    echo "  Make sure these DNS records point to your cluster's ingress IP:"
-    echo "  - *.dev.butterflycluster.com -> [your-cluster-ingress-ip]"
-    echo "  - keycloak.dev.butterflycluster.com -> [your-cluster-ingress-ip]"
-    echo
-    echo "🔗 Access Applications:"
-    echo "  - Keycloak: https://keycloak.dev.butterflycluster.com"
-    echo "  - Add more apps with VirtualServices referencing 'istio-system/dev-wildcard-gateway'"
-  else
-    echo "⚠️  SSL certificates not configured. Run './compliance-lab.sh configure' to set up Cloudflare."
-  fi
+  echo "=== Environment Configuration ==="
+  echo "🌍 Environment: $DETECTED_ENV"
+  echo "🌐 Domain: $K3S_INGRESS_DOMAIN"
+  echo "🔒 Certificates: $([ "$USE_PROD_CERTS" = "true" ] && echo "Production (Let's Encrypt)" || echo "Staging (Let's Encrypt)")"
+  echo
+  echo "🔗 Applications:"
+  echo "  - Test App: https://app.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Echo server for compliance testing"
+  echo "  - Keycloak: https://keycloak.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Admin: admin/admin"
+  echo "  - Grafana: https://grafana.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Admin: admin/prom-operator"
+  echo "  - Prometheus: https://prometheus.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Metrics and alerting"
+  echo "  - AlertManager: https://alertmanager.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Alert management"
+  echo "  - MinIO S3 API: https://minio.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Access: myaccesskey/mysecretkey"
+  echo "  - MinIO Console: https://minio-console.${K3S_INGRESS_DOMAIN}"
+  echo "    └── Web UI for MinIO management"
+  echo
+  echo "📋 DNS Setup Required:"
+  echo "  *.${K3S_INGRESS_DOMAIN} -> $(kubectl -n istio-system get svc istio-ingressgateway -o jsonpath='{.status.loadBalancer.ingress[0].ip}' 2>/dev/null || echo '[cluster-ip]')"
+  echo
+  echo "💡 Certificate Management:"
+  echo "  Current: istio-system/${DETECTED_ENV}-wildcard-tls"
+  echo "  Check: kubectl get certificate -n istio-system"
+  echo "  Renew: Delete secret and run 'up' again"
 }
 
 destroy_cluster() {
-  deregister_cluster
-  echo ">>> Deleting k3d cluster..."
+  log "Destroying cluster: $CLUSTER_NAME"
   k3d cluster delete "$CLUSTER_NAME" || true
-  echo ">>> Cluster removed."
+  log "Cluster destroyed"
+}
 
-  # Optional cleanup
-  if [ "$AUTO_DOCKER_PRUNE" = "true" ]; then
-    cleanup_docker "$PRUNE_DOCKER_VOLUMES"
-  else
-    if prompt_yes_no ">>> Run Docker prune to free space now?" "n"; then
-      cleanup_docker "$(prompt_yes_no ">>> Also prune volumes?" "n" && echo true || echo false)"
-    fi
+register_cluster() {
+  # Rancher configuration is loaded from the main compliance-lab config file
+  if [ -z "$RANCHER_URL" ] || [ -z "$RANCHER_BEARER_TOKEN" ]; then
+    log "Rancher not configured in config/compliance-lab.${DETECTED_ENV}"
+    log "Set RANCHER_URL and RANCHER_BEARER_TOKEN to enable registration"
+    return 0
   fi
 
-  # Optional Rancher filesystem purge
-  cleanup_rancher_fs
+  log "Registering cluster with Rancher..."
 
-  echo ">>> Cleanup complete."
+  # Simple registration - create cluster and apply manifest
+  local cluster_json
+  cluster_json=$(curl -sk -X POST "$RANCHER_URL/v3/clusters" \
+    -H "Authorization: Bearer $RANCHER_BEARER_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"type\":\"cluster\",\"name\":\"$CLUSTER_NAME\"}")
+
+  local cluster_id
+  cluster_id=$(echo "$cluster_json" | jq -r '.id // empty')
+  [ -n "$cluster_id" ] || fail "Failed to create cluster in Rancher"
+
+  log "Created cluster: $cluster_id"
+
+  # Get registration manifest and apply
+  local token_json
+  token_json=$(curl -sk -X POST "$RANCHER_URL/v3/clusterregistrationtokens" \
+    -H "Authorization: Bearer $RANCHER_BEARER_TOKEN" \
+    -H "Content-Type: application/json" \
+    -d "{\"type\":\"clusterRegistrationToken\",\"clusterId\":\"$cluster_id\"}")
+
+  local token_id
+  token_id=$(echo "$token_json" | jq -r '.id // empty')
+  [ -n "$token_id" ] || fail "Failed to create registration token"
+
+  # Wait for manifest URL
+  local manifest_url=""
+  for i in {1..30}; do
+    local token_data
+    token_data=$(curl -sk "$RANCHER_URL/v3/clusterregistrationtokens/$token_id" \
+      -H "Authorization: Bearer $RANCHER_BEARER_TOKEN")
+    manifest_url=$(echo "$token_data" | jq -r '.manifestUrl // empty')
+    [ -n "$manifest_url" ] && break
+    sleep 5
+  done
+
+  [ -n "$manifest_url" ] || fail "Registration manifest not ready"
+
+  log "Applying registration manifest..."
+  curl -skL "$manifest_url" | kubectl apply -f - || fail "Failed to apply registration manifest"
+
+  log "Cluster registered with Rancher successfully"
+}
+
+deregister_cluster() {
+  # Rancher configuration is loaded from the main compliance-lab config file
+  if [ -z "$RANCHER_URL" ] || [ -z "$RANCHER_BEARER_TOKEN" ]; then
+    log "Rancher not configured in config/compliance-lab.${DETECTED_ENV}"
+    log "Set RANCHER_URL and RANCHER_BEARER_TOKEN to enable deregistration"
+    return 0
+  fi
+
+  log "Deregistering cluster from Rancher..."
+
+  # Remove cattle-system namespace and Rancher agent
+  kubectl delete namespace cattle-system --ignore-not-found=true || true
+  kubectl delete namespace cattle-fleet-system --ignore-not-found=true || true
+
+  # Find cluster by name in Rancher and delete it
+  local clusters_json
+  clusters_json=$(curl -sk -X GET "$RANCHER_URL/v3/clusters" \
+    -H "Authorization: Bearer $RANCHER_BEARER_TOKEN") || {
+    log "Warning: Could not retrieve clusters from Rancher API"
+    return 0
+  }
+
+  local cluster_id
+  cluster_id=$(echo "$clusters_json" | jq -r ".data[] | select(.name==\"$CLUSTER_NAME\") | .id" | head -1)
+
+  if [ -n "$cluster_id" ] && [ "$cluster_id" != "null" ]; then
+    log "Removing cluster '$CLUSTER_NAME' (ID: $cluster_id) from Rancher..."
+    curl -sk -X DELETE "$RANCHER_URL/v3/clusters/$cluster_id" \
+      -H "Authorization: Bearer $RANCHER_BEARER_TOKEN" || {
+      log "Warning: Failed to delete cluster from Rancher API"
+    }
+    log "Cluster deregistered from Rancher successfully"
+  else
+    log "Cluster '$CLUSTER_NAME' not found in Rancher"
+  fi
+}
+
+configure_cloudflare() {
+  echo "--- Cloudflare Configuration ---"
+  echo
+
+  read -p "Cloudflare email: " cf_email
+  read -sp "Cloudflare API token: " cf_token
+  echo
+  read -p "Cloudflare Zone ID: " cf_zone_id
+
+  [ -n "$cf_email" ] && [ -n "$cf_token" ] && [ -n "$cf_zone_id" ] || fail "All fields required"
+
+  cat > config/compliance-lab.env <<EOF
+# Compliance Lab k3s Cluster Configuration
+
+# Cloudflare Configuration (Required for SSL certificates)
+export CLOUDFLARE_EMAIL="$cf_email"
+export CLOUDFLARE_API_TOKEN="$cf_token"
+export CLOUDFLARE_ZONE_ID="$cf_zone_id"
+EOF
+
+  log "Configuration saved to config/compliance-lab.env"
 }
 
 # --- Main Logic ---
 
-load_config
 check_deps
 
 case "${1:-}" in
-  up) create_cluster ;; 
-  down) destroy_cluster ;; 
-  reset) 
-    destroy_cluster 
-    create_cluster 
-    ;; 
-  rancher-up) rancher_up ;; 
-  rancher-down) rancher_down ;; 
-  rancher-reset) rancher_reset ;; 
-  configure) configure_all ;;
-  configure-cloudflare) configure_cloudflare ;; 
-  cleanup) cleanup ;;
-  *) 
-    echo "Usage: $0 {up|down|reset|rancher-up|rancher-down|rancher-reset|configure|cleanup}"
+  up)
+    shift
+    create_cluster "$@"
+    ;;
+  down)
+    destroy_cluster
+    ;;
+  reset)
+    destroy_cluster
+    create_cluster
+    ;;
+  register)
+    register_cluster
+    ;;
+  deregister)
+    deregister_cluster
+    ;;
+  configure)
+    configure_cloudflare
+    ;;
+  *)
+    echo "Usage: $0 {up|down|reset|register|deregister|configure}"
     echo
-    echo "SSL Certificate Features:"
-    echo "  • Automatic wildcard SSL certificates for *.dev.butterflycluster.com"
-    echo "  • Let's Encrypt integration with Cloudflare DNS-01 challenges"
-    echo "  • Istio Gateway configured for HTTPS termination"
-    echo "  • Run 'configure' command to set up Cloudflare API credentials"
+    echo "Commands:"
+    echo "  up                   Create cluster (auto prod certs for prod env)"
+    echo "  down                 Delete cluster"
+    echo "  reset               Recreate cluster"
+    echo "  register            Register with Rancher (optional)"
+    echo "  deregister          Remove from Rancher (optional)"
+    echo "  configure           Setup Cloudflare credentials"
     echo
-    echo "SSL Configuration options:"
-    echo "  REQUIRE_SSL=true                 Fail if SSL setup fails (default: true)"
-    echo "  REQUIRE_SSL=false                Warn but continue if SSL setup fails"
+    echo "Environment Control:"
+    echo "  Create config/compliance-lab.local    # Configure K3S_INGRESS_DOMAIN"
+    echo "  Create config/compliance-lab.staging  # Configure K3S_INGRESS_DOMAIN"
     echo
-    echo "Teardown cleanup options:"
-    echo "  AUTO_DOCKER_PRUNE=true           Auto-prune Docker on teardown"
-    echo "  PRUNE_DOCKER_VOLUMES=true        Also prune Docker volumes (aggressive)"
-    echo "  AUTO_RANCHER_PURGE=true          Purge contents of $RANCHER_DIR during cleanup"
-    echo "  RANCHER_DIR=/var/lib/rancher     Path to Rancher data on host"
-    exit 1 
-    ;; 
+    echo "Examples:"
+    echo "  $0 up                      # Staging certs (local/dev/staging env)"
+    echo "  # Production certs automatically used with config/compliance-lab.prod"
+    exit 1
+    ;;
 esac

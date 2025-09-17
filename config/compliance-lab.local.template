@@ -1,0 +1,28 @@
+# Compliance Lab k3s Cluster Configuration
+# Environment Configuration Template
+# Copy this file to: config/compliance-lab.{ENV} (e.g., compliance-lab.local, compliance-lab.prod)
+# Customize values for your environment
+
+# Domain configuration (required)
+# Set your actual domain for this environment
+K3S_INGRESS_DOMAIN=local.yourdomain.com
+
+# Override cluster name (default: compliance-lab)
+# CLUSTER_NAME=my-cluster
+
+# --- SSL Certificate Configuration ---
+# Local environments use staging certificates to avoid rate limits
+# Production certificates are automatically used for config/compliance-lab.prod
+
+# Cloudflare Configuration (Required for SSL certificates)
+# Get these from your Cloudflare dashboard: https://dash.cloudflare.com/profile/api-tokens
+CLOUDFLARE_EMAIL=your-email@yourdomain.com
+CLOUDFLARE_API_TOKEN=your_cloudflare_api_token_here
+CLOUDFLARE_ZONE_ID=your_cloudflare_zone_id_here
+
+# --- Optional Rancher Integration ---
+# Configure these if you want to register with an existing Rancher instance
+# After configuring, run: ./compliance-lab.sh register
+# To remove: ./compliance-lab.sh deregister
+# RANCHER_URL=https://rancher.yourdomain.com
+# RANCHER_BEARER_TOKEN="token-xxxxx:your_rancher_bearer_token_here"

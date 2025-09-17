@@ -1,6 +1,13 @@
-# Ignore Rancher credentials file(s)
+# Ignore actual config files with secrets (but track templates)
+config/compliance-lab.*
+!config/compliance-lab.*.template
+# Legacy rancher files (can be removed after migration)
+config/rancher.*
 rancher.env
 rancher.env~
 
 # Runtime credentials for Velero S3 (generated)
 manifests/minio-credentials
+
+# Certificate backups (contain private keys)
+cluster-state/

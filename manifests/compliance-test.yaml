@@ -21,6 +21,29 @@ spec:
         image: ghcr.io/ktock/echo-server:latest
         ports:
         - containerPort: 8080
+        resources:
+          requests:
+            memory: "64Mi"
+            cpu: "50m"
+          limits:
+            memory: "128Mi"
+            cpu: "100m"
+---
+apiVersion: v1
+kind: Service
+metadata:
+  name: web
+  namespace: compliance-test
+  labels:
+    app: web
+spec:
+  ports:
+  - name: http
+    port: 80
+    targetPort: 8080
+  selector:
+    app: web
+  type: ClusterIP
 ---
 apiVersion: policy/v1
 kind: PodDisruptionBudget
