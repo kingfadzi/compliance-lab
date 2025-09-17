@@ -28,7 +28,7 @@ spec:
   hosts:
   - hello-world.local.butterflycluster.com
   gateways:
-  - istio-system/prod-wildcard-gateway
+  - istio-system/local-wildcard-gateway
   http:
   - match:
     - uri:

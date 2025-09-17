@@ -18,12 +18,17 @@ spec:
   - Egress
   ingress:
   - from:
+    # Allow traffic from Istio ingress gateway
     - namespaceSelector:
         matchLabels:
-          name: ingress-nginx
+          kubernetes.io/metadata.name: istio-system
+      podSelector:
+        matchLabels:
+          istio: ingressgateway
+    # Allow Prometheus scraping from monitoring namespace
     - namespaceSelector:
         matchLabels:
-          name: monitoring
+          kubernetes.io/metadata.name: monitoring
       podSelector:
         matchLabels:
           app: prometheus
@@ -41,10 +46,11 @@ spec:
     - protocol: TCP
       port: 3000
   egress:
+  # Permit DNS to CoreDNS in kube-system
   - to:
     - namespaceSelector:
         matchLabels:
-          name: kube-system
+          kubernetes.io/metadata.name: kube-system
       podSelector:
         matchLabels:
           k8s-app: kube-dns
@@ -53,6 +59,14 @@ spec:
       port: 53
     - protocol: TCP
       port: 53
+  # Allow Istio sidecar to reach istiod control plane
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: istio-system
+    ports:
+    - protocol: TCP
+      port: 15012
   - to:
     - namespaceSelector:
         matchLabels:
