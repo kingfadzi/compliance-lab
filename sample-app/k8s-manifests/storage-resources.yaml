@@ -1,0 +1,577 @@
+# PVC removed - not needed for simple demo app
+---
+apiVersion: policy/v1
+kind: PodDisruptionBudget
+metadata:
+  name: hello-world-pdb
+  namespace: hello-world-app
+  labels:
+    app: hello-world
+    compliance.availability/protected: "true"
+spec:
+  minAvailable: 1
+  selector:
+    matchLabels:
+      app: hello-world
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata:
+  name: hello-world-hpa
+  namespace: hello-world-app
+  labels:
+    app: hello-world
+    compliance.availability/auto-scaling: "true"
+spec:
+  scaleTargetRef:
+    apiVersion: apps/v1
+    kind: Deployment
+    name: hello-world-app
+  minReplicas: 3
+  maxReplicas: 10
+  metrics:
+  - type: Resource
+    resource:
+      name: cpu
+      target:
+        type: Utilization
+        averageUtilization: 70
+  - type: Resource
+    resource:
+      name: memory
+      target:
+        type: Utilization
+        averageUtilization: 80
+  behavior:
+    scaleDown:
+      stabilizationWindowSeconds: 300
+      policies:
+      - type: Percent
+        value: 10
+        periodSeconds: 60
+    scaleUp:
+      stabilizationWindowSeconds: 0
+      policies:
+      - type: Percent
+        value: 100
+        periodSeconds: 15
+      - type: Pods
+        value: 4
+        periodSeconds: 15
+      selectPolicy: Max
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: hello-world-app-code
+  namespace: hello-world-app
+  labels:
+    app: hello-world
+    compliance.integrity/immutable: "true"
+data:
+  package.json: |
+    {
+      "name": "hello-world-compliance-demo",
+      "version": "1.0.0",
+      "description": "Sample Node.js app for compliance evidence collection and service integration",
+      "main": "server.js",
+      "scripts": {
+        "start": "node server.js"
+      },
+      "dependencies": {},
+      "keywords": ["compliance", "kubernetes", "microservices", "monitoring", "security"],
+      "author": "Compliance Lab Team",
+      "license": "MIT"
+    }
+  server.js: |
+    const http = require('http');
+    const url = require('url');
+    const querystring = require('querystring');
+    const port = process.env.PORT || 8080;
+
+    // Service endpoints from environment variables
+    const services = {
+      keycloak: process.env.KEYCLOAK_URL || 'http://keycloak.keycloak.svc.cluster.local:8080',
+      minio: process.env.S3_ENDPOINT || 'http://minio.minio.svc.cluster.local:9000',
+      prometheus: process.env.PROMETHEUS_URL || 'http://kube-prometheus-stack-prometheus.monitoring.svc.cluster.local:9090',
+      grafana: process.env.GRAFANA_URL || 'http://kube-prometheus-stack-grafana.monitoring.svc.cluster.local:80',
+      alertmanager: process.env.ALERTMANAGER_URL || 'http://kube-prometheus-stack-alertmanager.monitoring.svc.cluster.local:9093'
+    };
+
+    // Helper function to make HTTP requests
+    function makeRequest(url, options = {}) {
+      return new Promise((resolve, reject) => {
+        const req = http.request(url, { timeout: 5000, ...options }, (res) => {
+          let data = '';
+          res.on('data', chunk => data += chunk);
+          res.on('end', () => {
+            try {
+              resolve({
+                statusCode: res.statusCode,
+                data: res.headers['content-type']?.includes('application/json') ? JSON.parse(data) : data,
+                headers: res.headers
+              });
+            } catch (e) {
+              resolve({ statusCode: res.statusCode, data: data.slice(0, 200), headers: res.headers });
+            }
+          });
+        });
+        req.on('timeout', () => {
+          req.destroy();
+          reject(new Error('Request timeout'));
+        });
+        req.on('error', reject);
+        if (options.body) req.write(options.body);
+        req.end();
+      });
+    }
+
+    // HTML Dashboard
+    function getDashboardHTML() {
+      return `
+    <!DOCTYPE html>
+    <html>
+    <head>
+      <title>Compliance Lab - Service Integration Dashboard</title>
+      <meta charset="utf-8">
+      <meta name="viewport" content="width=device-width, initial-scale=1">
+      <style>
+        body { font-family: Arial, sans-serif; max-width: 1200px; margin: 0 auto; padding: 20px; background: #f5f5f5; }
+        .header { background: #2c3e50; color: white; padding: 20px; border-radius: 8px; margin-bottom: 30px; text-align: center; }
+        .services { display: grid; grid-template-columns: repeat(auto-fit, minmax(300px, 1fr)); gap: 20px; }
+        .service-card { background: white; padding: 20px; border-radius: 8px; box-shadow: 0 2px 4px rgba(0,0,0,0.1); }
+        .service-title { color: #2c3e50; border-bottom: 2px solid #3498db; padding-bottom: 10px; margin-bottom: 15px; }
+        button { background: #3498db; color: white; border: none; padding: 10px 20px; border-radius: 4px; cursor: pointer; margin: 5px; }
+        button:hover { background: #2980b9; }
+        .status { padding: 10px; margin: 10px 0; border-radius: 4px; font-weight: bold; }
+        .success { background: #d4edda; color: #155724; border: 1px solid #c3e6cb; }
+        .error { background: #f8d7da; color: #721c24; border: 1px solid #f5c6cb; }
+        .info { background: #d1ecf1; color: #0c5460; border: 1px solid #bee5eb; }
+        input[type="file"] { margin: 10px 0; }
+        .response { background: #f8f9fa; border: 1px solid #dee2e6; padding: 10px; border-radius: 4px; margin: 10px 0; font-family: monospace; white-space: pre-wrap; max-height: 200px; overflow-y: auto; }
+        .system-status { background: #e9ecef; padding: 15px; border-radius: 8px; margin: 20px 0; text-align: center; }
+        .indicator { display: inline-block; margin: 0 10px; padding: 5px 10px; border-radius: 4px; font-weight: bold; }
+        .indicator.healthy { background: #28a745; color: white; }
+        .indicator.unhealthy { background: #dc3545; color: white; }
+        .indicator.unknown { background: #6c757d; color: white; }
+      </style>
+    </head>
+    <body>
+      <div class="header">
+        <h1>🏗️ Compliance Lab Service Integration Dashboard</h1>
+        <p>Environment: ${process.env.NODE_ENV || 'development'} | Version: 1.0.0 | Timestamp: ${new Date().toISOString()}</p>
+      </div>
+
+      <div class="system-status">
+        <h3>🖥️ System Overview</h3>
+        <div id="systemStatus">Loading system status...</div>
+      </div>
+
+      <div class="services">
+        <div class="service-card">
+          <h3 class="service-title">🔐 Authentication Service (Keycloak)</h3>
+          <p>Test connectivity to Keycloak identity provider</p>
+          <button onclick="testKeycloak()">Test Connection</button>
+          <button onclick="getKeycloakRealms()">Get Realms</button>
+          <div id="keycloakStatus"></div>
+        </div>
+
+        <div class="service-card">
+          <h3 class="service-title">📦 Object Storage (MinIO)</h3>
+          <p>Test S3-compatible object storage operations</p>
+          <button onclick="testMinIO()">Test Connection</button>
+          <button onclick="listBuckets()">List Buckets</button>
+          <div>
+            <input type="file" id="fileUpload" accept="*/*">
+            <button onclick="uploadFile()">Upload Test File</button>
+          </div>
+          <div id="minioStatus"></div>
+        </div>
+
+        <div class="service-card">
+          <h3 class="service-title">📊 Monitoring (Prometheus)</h3>
+          <p>Query metrics and monitoring data</p>
+          <button onclick="testPrometheus()">Test Connection</button>
+          <button onclick="getMetrics()">Get App Metrics</button>
+          <button onclick="getTargets()">Get Targets</button>
+          <div id="prometheusStatus"></div>
+        </div>
+
+        <div class="service-card">
+          <h3 class="service-title">🚨 AlertManager</h3>
+          <p>Check alert management system</p>
+          <button onclick="testAlertManager()">Test Connection</button>
+          <button onclick="getAlerts()">Get Active Alerts</button>
+          <div id="alertmanagerStatus"></div>
+        </div>
+
+        <div class="service-card">
+          <h3 class="service-title">📈 Grafana Dashboards</h3>
+          <p>Access monitoring dashboards</p>
+          <button onclick="testGrafana()">Test Connection</button>
+          <button onclick="openGrafana()">Open Grafana</button>
+          <div id="grafanaStatus"></div>
+        </div>
+
+        <div class="service-card">
+          <h3 class="service-title">🧪 Application Health</h3>
+          <p>Application-specific health checks</p>
+          <button onclick="refreshHealth()">Refresh Health</button>
+          <button onclick="getAppMetrics()">Get App Metrics</button>
+          <div id="appStatus"></div>
+        </div>
+      </div>
+
+      <script>
+        // Helper function for API calls
+        async function apiCall(endpoint, options = {}) {
+          try {
+            const response = await fetch(endpoint, {
+              method: options.method || 'GET',
+              headers: { 'Content-Type': 'application/json', ...options.headers },
+              body: options.body ? JSON.stringify(options.body) : undefined
+            });
+            return await response.json();
+          } catch (error) {
+            return { error: error.message };
+          }
+        }
+
+        // Display functions
+        function displayStatus(elementId, result, title) {
+          const element = document.getElementById(elementId);
+          const statusClass = result.error ? 'error' : 'success';
+          const statusIcon = result.error ? '❌' : '✅';
+          element.innerHTML = '<div class="status ' + statusClass + '">' +
+            statusIcon + ' ' + title + ': ' + (result.error || 'Success') +
+            '</div><div class="response">' + JSON.stringify(result, null, 2) + '</div>';
+        }
+
+        // Keycloak functions
+        async function testKeycloak() {
+          const result = await apiCall('/api/test-keycloak');
+          displayStatus('keycloakStatus', result, 'Keycloak Connection');
+        }
+
+        async function getKeycloakRealms() {
+          const result = await apiCall('/api/keycloak-realms');
+          displayStatus('keycloakStatus', result, 'Keycloak Realms');
+        }
+
+        // MinIO functions
+        async function testMinIO() {
+          const result = await apiCall('/api/test-minio');
+          displayStatus('minioStatus', result, 'MinIO Connection');
+        }
+
+        async function listBuckets() {
+          const result = await apiCall('/api/minio-buckets');
+          displayStatus('minioStatus', result, 'MinIO Buckets');
+        }
+
+        async function uploadFile() {
+          const fileInput = document.getElementById('fileUpload');
+          if (!fileInput.files.length) {
+            displayStatus('minioStatus', { error: 'Please select a file first' }, 'File Upload');
+            return;
+          }
+          displayStatus('minioStatus', { message: 'File upload feature requires multipart form handling - showing test response' }, 'File Upload Simulation');
+        }
+
+        // Prometheus functions
+        async function testPrometheus() {
+          const result = await apiCall('/api/test-prometheus');
+          displayStatus('prometheusStatus', result, 'Prometheus Connection');
+        }
+
+        async function getMetrics() {
+          const result = await apiCall('/api/prometheus-metrics');
+          displayStatus('prometheusStatus', result, 'Prometheus Metrics');
+        }
+
+        async function getTargets() {
+          const result = await apiCall('/api/prometheus-targets');
+          displayStatus('prometheusStatus', result, 'Prometheus Targets');
+        }
+
+        // AlertManager functions
+        async function testAlertManager() {
+          const result = await apiCall('/api/test-alertmanager');
+          displayStatus('alertmanagerStatus', result, 'AlertManager Connection');
+        }
+
+        async function getAlerts() {
+          const result = await apiCall('/api/alertmanager-alerts');
+          displayStatus('alertmanagerStatus', result, 'Active Alerts');
+        }
+
+        // Grafana functions
+        async function testGrafana() {
+          const result = await apiCall('/api/test-grafana');
+          displayStatus('grafanaStatus', result, 'Grafana Connection');
+        }
+
+        function openGrafana() {
+          window.open('https://grafana.${process.env.K3S_INGRESS_DOMAIN || 'local.butterflycluster.com'}', '_blank');
+        }
+
+        // App health functions
+        async function refreshHealth() {
+          const result = await apiCall('/health');
+          displayStatus('appStatus', result, 'Application Health');
+        }
+
+        async function getAppMetrics() {
+          const result = await apiCall('/metrics');
+          displayStatus('appStatus', result, 'Application Metrics');
+        }
+
+        // System status
+        async function updateSystemStatus() {
+          try {
+            const status = await apiCall('/api/system-status');
+            const statusDiv = document.getElementById('systemStatus');
+            let statusHTML = '';
+
+            for (const [service, health] of Object.entries(status)) {
+              const indicatorClass = health.healthy ? 'healthy' : health.tested ? 'unhealthy' : 'unknown';
+              const statusText = health.healthy ? '✅' : health.tested ? '❌' : '❓';
+              statusHTML += '<span class="indicator ' + indicatorClass + '">' + statusText + ' ' + service + '</span>';
+            }
+            statusDiv.innerHTML = statusHTML;
+          } catch (error) {
+            document.getElementById('systemStatus').innerHTML = '<span class="indicator unknown">❓ Unable to load system status</span>';
+          }
+        }
+
+        // Initialize dashboard
+        document.addEventListener('DOMContentLoaded', function() {
+          updateSystemStatus();
+          setInterval(updateSystemStatus, 30000); // Update every 30 seconds
+        });
+      </script>
+    </body>
+    </html>`;
+    }
+
+    const server = http.createServer(async (req, res) => {
+      const parsedUrl = url.parse(req.url, true);
+      const pathname = parsedUrl.pathname;
+      const query = parsedUrl.query;
+
+      // Set CORS headers
+      res.setHeader('Access-Control-Allow-Origin', '*');
+      res.setHeader('Access-Control-Allow-Methods', 'GET, POST, PUT, DELETE');
+      res.setHeader('Access-Control-Allow-Headers', 'Content-Type');
+
+      if (pathname === '/') {
+        res.setHeader('Content-Type', 'text/html');
+        res.writeHead(200);
+        res.end(getDashboardHTML());
+
+      } else if (pathname === '/health') {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          status: 'healthy',
+          timestamp: new Date().toISOString(),
+          services: Object.keys(services)
+        }));
+
+      } else if (pathname === '/ready') {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(200);
+        res.end(JSON.stringify({
+          status: 'ready',
+          timestamp: new Date().toISOString()
+        }));
+
+      } else if (pathname === '/metrics') {
+        res.setHeader('Content-Type', 'text/plain');
+        res.writeHead(200);
+        res.end('# HELP app_requests_total Total requests\n' +
+          '# TYPE app_requests_total counter\n' +
+          'app_requests_total{method="GET",status="200"} ' + Math.floor(Math.random() * 1000) + '\n' +
+          '# HELP app_uptime_seconds Application uptime in seconds\n' +
+          '# TYPE app_uptime_seconds gauge\n' +
+          'app_uptime_seconds ' + Math.floor(process.uptime()) + '\n');
+
+      } else if (pathname.startsWith('/api/')) {
+        res.setHeader('Content-Type', 'application/json');
+
+        try {
+          let result = {};
+
+          switch (pathname) {
+            case '/api/test-keycloak':
+              try {
+                const response = await makeRequest(services.keycloak + '/realms/master');
+                result = {
+                  status: 'connected',
+                  endpoint: services.keycloak,
+                  realm: response.data?.realm || 'master',
+                  statusCode: response.statusCode
+                };
+              } catch (error) {
+                result = { error: 'Connection failed: ' + error.message, endpoint: services.keycloak };
+              }
+              break;
+
+            case '/api/keycloak-realms':
+              try {
+                const response = await makeRequest(services.keycloak + '/realms/master');
+                result = {
+                  realms: [response.data?.realm || 'master'],
+                  endpoint: services.keycloak,
+                  available: true
+                };
+              } catch (error) {
+                result = { error: 'Failed to fetch realms: ' + error.message };
+              }
+              break;
+
+            case '/api/test-minio':
+              try {
+                const response = await makeRequest(services.minio);
+                result = {
+                  status: 'connected',
+                  endpoint: services.minio,
+                  statusCode: response.statusCode,
+                  s3_compatible: true
+                };
+              } catch (error) {
+                result = { error: 'Connection failed: ' + error.message, endpoint: services.minio };
+              }
+              break;
+
+            case '/api/minio-buckets':
+              result = {
+                buckets: [process.env.S3_BUCKET || 'hello-world-data', 'velero'],
+                endpoint: services.minio,
+                note: 'Simulated bucket list - actual S3 API requires authentication'
+              };
+              break;
+
+            case '/api/test-prometheus':
+              try {
+                const response = await makeRequest(services.prometheus + '/api/v1/status/config');
+                result = {
+                  status: 'connected',
+                  endpoint: services.prometheus,
+                  version: 'Prometheus Server',
+                  statusCode: response.statusCode
+                };
+              } catch (error) {
+                result = { error: 'Connection failed: ' + error.message, endpoint: services.prometheus };
+              }
+              break;
+
+            case '/api/prometheus-metrics':
+              try {
+                const response = await makeRequest(services.prometheus + '/api/v1/query?query=up');
+                result = {
+                  metrics: 'up query executed',
+                  endpoint: services.prometheus,
+                  data: response.data?.data || 'metrics available'
+                };
+              } catch (error) {
+                result = { error: 'Metrics query failed: ' + error.message };
+              }
+              break;
+
+            case '/api/prometheus-targets':
+              try {
+                const response = await makeRequest(services.prometheus + '/api/v1/targets');
+                result = {
+                  targets: 'targets endpoint queried',
+                  endpoint: services.prometheus,
+                  active_targets: response.data?.data?.activeTargets?.length || 'unknown'
+                };
+              } catch (error) {
+                result = { error: 'Targets query failed: ' + error.message };
+              }
+              break;
+
+            case '/api/test-alertmanager':
+              try {
+                const response = await makeRequest(services.alertmanager + '/api/v1/status');
+                result = {
+                  status: 'connected',
+                  endpoint: services.alertmanager,
+                  statusCode: response.statusCode
+                };
+              } catch (error) {
+                result = { error: 'Connection failed: ' + error.message, endpoint: services.alertmanager };
+              }
+              break;
+
+            case '/api/alertmanager-alerts':
+              try {
+                const response = await makeRequest(services.alertmanager + '/api/v1/alerts');
+                result = {
+                  alerts: response.data || [],
+                  endpoint: services.alertmanager,
+                  count: Array.isArray(response.data) ? response.data.length : 'unknown'
+                };
+              } catch (error) {
+                result = { error: 'Alerts query failed: ' + error.message };
+              }
+              break;
+
+            case '/api/test-grafana':
+              try {
+                const response = await makeRequest(services.grafana + '/api/health');
+                result = {
+                  status: 'connected',
+                  endpoint: services.grafana,
+                  statusCode: response.statusCode
+                };
+              } catch (error) {
+                result = { error: 'Connection failed: ' + error.message, endpoint: services.grafana };
+              }
+              break;
+
+            case '/api/system-status':
+              result = {
+                keycloak: { healthy: true, tested: true },
+                minio: { healthy: true, tested: true },
+                prometheus: { healthy: true, tested: true },
+                alertmanager: { healthy: true, tested: true },
+                grafana: { healthy: true, tested: true }
+              };
+
+              // Test each service quickly
+              for (const [serviceName, serviceUrl] of Object.entries(services)) {
+                try {
+                  await makeRequest(serviceUrl, { timeout: 2000 });
+                  result[serviceName] = { healthy: true, tested: true };
+                } catch (error) {
+                  result[serviceName] = { healthy: false, tested: true, error: error.message };
+                }
+              }
+              break;
+
+            default:
+              result = { error: 'API endpoint not found' };
+          }
+
+          res.writeHead(200);
+          res.end(JSON.stringify(result, null, 2));
+
+        } catch (error) {
+          res.writeHead(500);
+          res.end(JSON.stringify({ error: 'Server error: ' + error.message }));
+        }
+
+      } else {
+        res.setHeader('Content-Type', 'application/json');
+        res.writeHead(404);
+        res.end(JSON.stringify({ error: 'Not found' }));
+      }
+    });
+
+    server.listen(port, () => {
+      console.log('Service Integration Dashboard running on port ' + port);
+      console.log('Services configured:');
+      Object.entries(services).forEach(([name, url]) => console.log('  ' + name + ': ' + url));
+    });

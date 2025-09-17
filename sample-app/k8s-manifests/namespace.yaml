@@ -1,0 +1,26 @@
+apiVersion: v1
+kind: Namespace
+metadata:
+  name: hello-world-app
+  labels:
+    app: hello-world
+    compliance.security/level: "confidential"
+    compliance.integrity/required: "true"
+    compliance.availability/tier: "high"
+    compliance.data-residency: "us-east"
+---
+apiVersion: v1
+kind: ResourceQuota
+metadata:
+  name: hello-world-quota
+  namespace: hello-world-app
+spec:
+  hard:
+    requests.cpu: "1"
+    requests.memory: 2Gi
+    limits.cpu: "2"
+    limits.memory: 4Gi
+    persistentvolumeclaims: "1"
+    services: "2"
+    secrets: "5"
+    configmaps: "5"

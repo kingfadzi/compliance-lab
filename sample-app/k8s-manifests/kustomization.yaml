@@ -1,0 +1,11 @@
+namespace: hello-world-app
+
+resources:
+  - namespace.yaml
+  - rbac.yaml
+  - storage-resources.yaml
+  - config-secrets.yaml
+  - deployment.yaml
+  - service-ingress.yaml
+  - network-policy.yaml
+
