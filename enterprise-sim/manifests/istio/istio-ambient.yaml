@@ -1,0 +1,53 @@
+apiVersion: install.istio.io/v1alpha1
+kind: Istio
+metadata:
+  name: default
+  namespace: istio-system
+spec:
+  # Istio version to install
+  version: v1.23.2
+  # Configuration for the control plane
+  values:
+    pilot:
+      # Enable ambient mesh mode
+      env:
+        EXTERNAL_ISTIOD: false
+        PILOT_ENABLE_AMBIENT: true
+    global:
+      # Mesh configuration
+      meshID: mesh1
+      multiCluster:
+        clusterName: enterprise-sim
+      network: network1
+  # Components to install
+  components:
+    pilot:
+      enabled: true
+    ingressGateways:
+    - name: istio-ingressgateway
+      enabled: true
+      k8s:
+        service:
+          type: LoadBalancer
+          ports:
+          - port: 15021
+            targetPort: 15021
+            name: status-port
+          - port: 80
+            targetPort: 8080
+            name: http2
+          - port: 443
+            targetPort: 8443
+            name: https
+    cni:
+      enabled: true
+      k8s:
+        overlays:
+        - apiVersion: apps/v1
+          kind: DaemonSet
+          name: istio-cni-node
+          patches:
+          - path: spec.template.spec.containers.[name:install-cni].securityContext.privileged
+            value: true
+    ztunnel:
+      enabled: true

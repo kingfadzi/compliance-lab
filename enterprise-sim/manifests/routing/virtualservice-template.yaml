@@ -1,0 +1,23 @@
+# Platform-generated VirtualService template
+# Env vars required: K3S_INGRESS_DOMAIN, GATEWAY_NAME, VS_NAME, VS_NAMESPACE, SVC_HOST, SVC_PORT, VS_HOST
+---
+apiVersion: networking.istio.io/v1beta1
+kind: VirtualService
+metadata:
+  name: ${VS_NAME}
+  namespace: ${VS_NAMESPACE}
+spec:
+  hosts:
+  - ${VS_HOST}
+  gateways:
+  - istio-system/${GATEWAY_NAME}
+  http:
+  - match:
+    - uri:
+        prefix: /
+    route:
+    - destination:
+        host: ${SVC_HOST}
+        port:
+          number: ${SVC_PORT}
+

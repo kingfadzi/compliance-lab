@@ -1,0 +1,22 @@
+
+*** These modified files were found in JOE when it aborted on Wed Sep 17 20:56:52 2025
+*** JOE was aborted because the terminal closed
+
+*** File '(Unnamed)'
+/Users/fadzi/.zshrc
+/Users/fadzi/.kube/config
+/Users/fadzi/.kube/config
+/Users/fadzi/.kube/config
+/Users/fadzi/.zshrc
+/Users/fadzi/.kube/config
+/Users/fadzi/.kube/config
+/Users/fadzi/.kube/config
+/Users/fadzi/.kube/config
+/Users/fadzi/.zshrc
+/Users/fadzi/.cline_cli/cline_cli_settings.json
+
+*** File '* Startup Log *'
+Processing '/opt/homebrew/Cellar/joe/4.6/etc/joe/joerc'...
+Processing '/opt/homebrew/Cellar/joe/4.6/etc/joe/ftyperc'...
+Finished processing /opt/homebrew/Cellar/joe/4.6/etc/joe/ftyperc
+Finished processing /opt/homebrew/Cellar/joe/4.6/etc/joe/joerc

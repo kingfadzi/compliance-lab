@@ -1,0 +1,43 @@
+varReference:
+  - kind: Deployment
+    path: metadata/name
+  - kind: Deployment
+    path: metadata/namespace
+  - kind: Deployment
+    path: metadata/labels
+  - kind: Deployment
+    path: spec/selector/matchLabels
+  - kind: Deployment
+    path: spec/template/metadata/labels
+  - kind: Deployment
+    path: spec/template/spec/containers/args
+  - kind: Service
+    path: metadata/name
+  - kind: Service
+    path: metadata/namespace
+  - kind: Service
+    path: metadata/labels
+  - kind: Service
+    path: metadata/annotations
+  - kind: Service
+    path: spec/selector
+  - kind: VirtualService
+    path: metadata/name
+  - kind: VirtualService
+    path: metadata/namespace
+  - kind: VirtualService
+    path: metadata/labels
+  - kind: VirtualService
+    path: spec/hosts
+  - kind: VirtualService
+    path: spec/gateways
+  - kind: VirtualService
+    path: spec/http/route/destination/host
+  - kind: DestinationRule
+    path: metadata/name
+  - kind: DestinationRule
+    path: metadata/namespace
+  - kind: DestinationRule
+    path: metadata/labels
+  - kind: DestinationRule
+    path: spec/host

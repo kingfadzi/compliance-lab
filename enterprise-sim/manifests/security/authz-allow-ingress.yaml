@@ -1,0 +1,13 @@
+# Minimal allow policy for ingress traffic from istio ingress gateway (placeholder)
+apiVersion: security.istio.io/v1beta1
+kind: AuthorizationPolicy
+metadata:
+  name: allow-ingress
+  namespace: placeholder-region
+spec:
+  action: ALLOW
+  rules:
+  - from:
+    - source:
+        namespaces: ["istio-system"]
+

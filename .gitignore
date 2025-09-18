@@ -11,3 +11,4 @@ manifests/minio-credentials
 
 # Certificate backups (contain private keys)
 cluster-state/
+.aider*

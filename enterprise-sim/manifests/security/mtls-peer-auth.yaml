@@ -1,0 +1,10 @@
+# STRICT mTLS per region namespace (placeholder; applied per-namespace in later milestone)
+apiVersion: security.istio.io/v1beta1
+kind: PeerAuthentication
+metadata:
+  name: default
+  namespace: placeholder-region
+spec:
+  mtls:
+    mode: STRICT
+

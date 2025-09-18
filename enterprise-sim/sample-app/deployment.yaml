@@ -1,0 +1,163 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: $(APP_NAME)
+  namespace: $(NAMESPACE)
+  labels:
+    app: $(APP_NAME)
+    version: v1
+    compliance.region: $(REGION)
+spec:
+  replicas: 2
+  selector:
+    matchLabels:
+      app: $(APP_NAME)
+      version: v1
+  template:
+    metadata:
+      labels:
+        app: $(APP_NAME)
+        version: v1
+        compliance.region: $(REGION)
+      annotations:
+        # Istio sidecar injection (automatic in labeled namespaces)
+        sidecar.istio.io/inject: "true"
+        # Security annotations
+        container.apparmor.security.beta.kubernetes.io/hello-app: runtime/default
+    spec:
+      serviceAccountName: default
+      securityContext:
+        # Pod-level security context
+        runAsNonRoot: true
+        runAsUser: 1000
+        runAsGroup: 1000
+        fsGroup: 1000
+        seccompProfile:
+          type: RuntimeDefault
+      containers:
+      - name: hello-app
+        # Replace with your actual image
+        image: python:3.11-slim
+        imagePullPolicy: Always
+        command: ["/bin/sh"]
+        args:
+        - -c
+        - |
+          apt-get update && apt-get install -y --no-install-recommends curl && rm -rf /var/lib/apt/lists/*
+          pip install Flask==2.3.3 cryptography==41.0.4 requests==2.31.0
+          cat > app.py << 'EOF'
+          #!/usr/bin/env python3
+          import os
+          import ssl
+          import tempfile
+          from datetime import datetime
+          from flask import Flask, request, jsonify
+          from cryptography import x509
+          from cryptography.x509.oid import NameOID
+          from cryptography.hazmat.primitives import hashes, serialization
+          from cryptography.hazmat.primitives.asymmetric import rsa
+
+          APP_NAME = os.getenv("APP_NAME", "hello-app")
+          REGION = os.getenv("REGION", "us")
+
+          app = Flask(__name__)
+
+          def generate_self_signed_cert():
+              private_key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+              subject = issuer = x509.Name([
+                  x509.NameAttribute(NameOID.COUNTRY_NAME, "US"),
+                  x509.NameAttribute(NameOID.ORGANIZATION_NAME, "Sample App"),
+                  x509.NameAttribute(NameOID.COMMON_NAME, APP_NAME),
+              ])
+              cert = x509.CertificateBuilder().subject_name(subject).issuer_name(issuer).public_key(
+                  private_key.public_key()).serial_number(x509.random_serial_number()).not_valid_before(
+                  datetime.utcnow()).not_valid_after(datetime.utcnow().replace(year=datetime.utcnow().year + 1)
+              ).add_extension(x509.SubjectAlternativeName([
+                  x509.DNSName("localhost"), x509.DNSName(APP_NAME), x509.DNSName("*.local")
+              ]), critical=False).sign(private_key, hashes.SHA256())
+              return private_key, cert
+
+          @app.route('/')
+          def hello():
+              return jsonify({
+                  'message': 'Hello from compliance-ready HTTPS service!',
+                  'service': APP_NAME,
+                  'region': REGION,
+                  'timestamp': datetime.utcnow().isoformat() + 'Z',
+                  'headers': dict(request.headers),
+                  'protocol': request.environ.get('SERVER_PROTOCOL', 'HTTPS'),
+                  'method': request.method
+              })
+
+          @app.route('/health')
+          def health():
+              return jsonify({'status': 'healthy', 'service': APP_NAME})
+
+          @app.route('/ready')
+          def ready():
+              return jsonify({'status': 'ready', 'service': APP_NAME})
+
+          if __name__ == '__main__':
+              private_key, cert = generate_self_signed_cert()
+              with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.crt') as f:
+                  f.write(cert.public_bytes(serialization.Encoding.PEM))
+                  cert_path = f.name
+              with tempfile.NamedTemporaryFile(mode='wb', delete=False, suffix='.key') as f:
+                  f.write(private_key.private_bytes(
+                      encoding=serialization.Encoding.PEM,
+                      format=serialization.PrivateFormat.PKCS8,
+                      encryption_algorithm=serialization.NoEncryption()))
+                  key_path = f.name
+              context = ssl.SSLContext(ssl.PROTOCOL_TLSv1_2)
+              context.load_cert_chain(cert_path, key_path)
+              print("Starting HTTPS server on port 443...")
+              app.run(host='0.0.0.0', port=443, ssl_context=context, debug=False)
+          EOF
+          python app.py
+        ports:
+        - name: https
+          containerPort: 443
+          protocol: TCP
+        securityContext:
+          # Container-level security context
+          allowPrivilegeEscalation: false
+          runAsNonRoot: true
+          runAsUser: 1000
+          runAsGroup: 1000
+          readOnlyRootFilesystem: false  # Flask needs to write temp files for certs
+          capabilities:
+            drop:
+            - ALL
+            add:
+            - NET_BIND_SERVICE  # Required for binding to port 443
+        resources:
+          requests:
+            memory: "128Mi"
+            cpu: "100m"
+          limits:
+            memory: "256Mi"
+            cpu: "200m"
+        livenessProbe:
+          httpGet:
+            path: /health
+            port: 443
+            scheme: HTTPS
+          initialDelaySeconds: 30
+          periodSeconds: 10
+          timeoutSeconds: 5
+        readinessProbe:
+          httpGet:
+            path: /ready
+            port: 443
+            scheme: HTTPS
+          initialDelaySeconds: 5
+          periodSeconds: 5
+          timeoutSeconds: 3
+        envFrom:
+        - configMapRef:
+            name: sample-app-env
+        env:
+        - name: NAMESPACE
+          valueFrom:
+            fieldRef:
+              fieldPath: metadata.namespace

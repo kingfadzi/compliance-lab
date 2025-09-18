@@ -1,0 +1,44 @@
+# Baseline NetworkPolicy per app namespace to "just work" with Istio
+# - Egress allow DNS (UDP/TCP 53) to CoreDNS in kube-system
+# - Egress allow Istio xDS to istiod on TCP 15012 in istio-system
+# - Ingress allow from Istio ingress gateway (istio=ingressgateway)
+# - Default deny otherwise
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: baseline-istio-access
+  namespace: placeholder-region
+spec:
+  podSelector: {}
+  policyTypes:
+  - Ingress
+  - Egress
+  ingress:
+  - from:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: istio-system
+      podSelector:
+        matchLabels:
+          istio: ingressgateway
+  egress:
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: kube-system
+      podSelector:
+        matchLabels:
+          k8s-app: kube-dns
+    ports:
+    - protocol: UDP
+      port: 53
+    - protocol: TCP
+      port: 53
+  - to:
+    - namespaceSelector:
+        matchLabels:
+          kubernetes.io/metadata.name: istio-system
+    ports:
+    - protocol: TCP
+      port: 15012
+
