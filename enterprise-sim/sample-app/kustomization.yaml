@@ -3,7 +3,6 @@ kind: Kustomization
 resources:
   - deployment.yaml
   - service.yaml
-  - virtualservice.yaml
   - destinationrule.yaml
 
 generatorOptions:
@@ -12,8 +11,9 @@ generatorOptions:
 configMapGenerator:
   - name: sample-app-env
     envs:
-      - .env
+      - .env  # App-only variables (APP_NAME, REGION)
 
+# App variables (from ConfigMap - visible to app)
 vars:
   - name: APP_NAME
     objref:
@@ -22,13 +22,6 @@ vars:
       name: sample-app-env
     fieldref:
       fieldpath: data.APP_NAME
-  - name: NAMESPACE
-    objref:
-      apiVersion: v1
-      kind: ConfigMap
-      name: sample-app-env
-    fieldref:
-      fieldpath: data.NAMESPACE
   - name: REGION
     objref:
       apiVersion: v1
@@ -36,26 +29,8 @@ vars:
       name: sample-app-env
     fieldref:
       fieldpath: data.REGION
-  - name: ROUTE_HOST
-    objref:
-      apiVersion: v1
-      kind: ConfigMap
-      name: sample-app-env
-    fieldref:
-      fieldpath: data.ROUTE_HOST
-  - name: K3S_INGRESS_DOMAIN
-    objref:
-      apiVersion: v1
-      kind: ConfigMap
-      name: sample-app-env
-    fieldref:
-      fieldpath: data.K3S_INGRESS_DOMAIN
-  - name: GATEWAY_NAME
-    objref:
-      apiVersion: v1
-      kind: ConfigMap
-      name: sample-app-env
-    fieldref:
-      fieldpath: data.GATEWAY_NAME
+
+# Platform variables (from environment - not visible to app)
+# NAMESPACE, ROUTE_HOST, K3S_INGRESS_DOMAIN, GATEWAY_NAME exported by platform script
 configurations:
   - kustomizeconfig.yaml

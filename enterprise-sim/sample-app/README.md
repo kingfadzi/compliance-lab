@@ -15,11 +15,10 @@ A minimal Python Flask HTTPS application designed for Sail Operator-managed Isti
 ### Deploy with `kubectl` + Kustomize (Recommended)
 
 ```bash
-# 1. Review and edit the defaults in sample-app/.env
-vi sample-app/.env
+# 1. (optional) Review intent in sample-app/.env.template
+# Edit ONLY ENVIRONMENT or APP_DOMAIN in .env.template (everything else is auto-generated)
 
-# (optional) export them for shell convenience
-set -a && source sample-app/.env && set +a
+# (Do not edit sample-app/.env directly — it will be re-generated)
 
 # 2. Apply the full stack with kubectl's built-in Kustomize support
 kubectl apply -k sample-app
@@ -39,7 +38,7 @@ The app will be available at: `https://<region>-<route_host>.<ingress_domain>` u
 kubectl kustomize sample-app | less
 
 # Update a single value (e.g., switch namespace) then re-apply
-# (edit sample-app/.env with your preferred editor)
+# (edit only sample-app/.env.template, not .env)
 kubectl apply -k sample-app
 
 # Clean up
@@ -70,14 +69,10 @@ kubectl delete -k sample-app
 
 ## Environment Variables
 
-| Variable | Default | Description |
-|----------|---------|-------------|
-| `NAMESPACE` | `region-us` | Kubernetes namespace |
-| `REGION` | `us` | Region identifier for routing |
-| `APP_NAME` | `hello-app` | Application name |
-| `ROUTE_HOST` | `hello` | Host label used for routing (`<region>-<route_host>`) |
-| `K3S_INGRESS_DOMAIN` | `localhost` | Base domain for external access |
-| `GATEWAY_NAME` | `dev-sim-gateway` | Istio gateway name |
+| Variable     | Default      | Description                                 |
+|--------------|-------------|---------------------------------------------|
+| `ENVIRONMENT`| `dev`       | Intention, controls all derived config      |
+| (others)     | *(derived)* | All others computed by orchestration script |
 
 ## Testing
 

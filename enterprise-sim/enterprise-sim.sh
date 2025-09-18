@@ -46,6 +46,42 @@ cluster_exists() {
   k3d cluster list -o json | jq -e ".[] | select(.name==\"$CLUSTER_NAME\")" >/dev/null 2>&1
 }
 
+generate_sample_app_env() {
+  # Load app intent from template
+  ENV_PATH="$(dirname "$0")/sample-app/.env.template"
+  APP_ENV_PATH="$(dirname "$0")/sample-app/.env"
+
+  # Load app intent (what the app declares about itself)
+  if [ -f "$ENV_PATH" ]; then
+    set -a
+    source "$ENV_PATH"
+    set +a
+  fi
+
+  # Set app intent defaults
+  : "${APP_NAME:=hello-app}"
+  : "${REGION:=us}"
+
+  # Platform computes all infrastructure values
+  require_domain
+  derive_env_defaults
+  : "${NAMESPACE:=region-${REGION}}"
+
+  # Write app-only .env file (app only sees what it needs)
+  cat > "$APP_ENV_PATH" <<EOF
+APP_NAME=$APP_NAME
+REGION=$REGION
+EOF
+
+  # Export only necessary variables for app deployment
+  export NAMESPACE APP_NAME REGION
+  # Also export platform config for status display
+  export K3S_INGRESS_DOMAIN
+
+  log "Generated app .env with intent only ($APP_ENV_PATH)"
+  log "Platform variables exported for manifest templating"
+}
+
 cmd_up() {
   check_deps_basic
   log "Creating k3d cluster: $CLUSTER_NAME"
@@ -70,12 +106,20 @@ cmd_up() {
   # Quick sanity
   log "Cluster nodes:"
   kubectl get nodes -o wide || true
+  generate_sample_app_env
 }
 
 cmd_down() {
   check_deps_basic
   log "Deleting k3d cluster: $CLUSTER_NAME"
   k3d cluster delete "$CLUSTER_NAME" || true
+
+  # Remove generated app config
+  APP_ENV_PATH="$(dirname "$0")/sample-app/.env"
+  if [ -f "$APP_ENV_PATH" ]; then
+    rm -f "$APP_ENV_PATH"
+    log "Removed sample-app .env config ($APP_ENV_PATH)"
+  fi
 }
 
 cmd_status() {
@@ -118,6 +162,15 @@ cmd_sail_up() {
   check_deps_helm
   log "Installing Sail Operator using Helm"
 
+  # Clean up any existing Istio CRDs to ensure a clean install by the operator
+  log "Checking for existing Istio CRDs..."
+  if kubectl get crd -oname | grep -q 'istio.io'; then
+    log "Deleting existing Istio CRDs to prevent conflicts..."
+    kubectl get crd -oname | grep 'istio.io' | xargs kubectl delete
+  else
+    log "No existing Istio CRDs found. Continuing..."
+  fi
+
   # Add Sail Operator Helm repository
   log "Adding Sail Operator Helm repository"
   helm repo add sailoperator https://istio-ecosystem.github.io/sail-operator >/dev/null 2>&1 || true
@@ -140,6 +193,30 @@ cmd_sail_up() {
   log "Sail Operator installed successfully"
 }
 
+wait_for_istio_crd() {
+  log "Waiting for Istio CRD (sailoperator.io/v1) to be registered..."
+  for i in {1..30}; do
+    if kubectl get crd istios.sailoperator.io >/dev/null 2>&1 || \
+       kubectl get crd istios.install.istio.io >/dev/null 2>&1; then
+      log "Istio CRD is registered."
+      return 0
+    fi
+    echo -n "."
+    sleep 2
+    if [ $i -eq 30 ]; then
+      echo # Newline
+      log "Sail Operator deployment status:"
+      kubectl -n sail-operator describe deploy sail-operator || true
+      log "Recent logs from Sail Operator:"
+      kubectl -n sail-operator logs deploy/sail-operator --tail=20 || true
+      log "Existing Istio CRDs:"
+      kubectl get crds | grep -E 'istio.io|sailoperator.io' || echo "(none found)"
+      fail "Istio CRD (sailoperator.io/v1) did not appear after 60s."
+    fi
+  done
+  echo # Newline
+}
+
 cmd_istio_up() {
   check_deps_basic
   log "Applying Istio mesh configuration via CRD manifest"
@@ -148,6 +225,13 @@ cmd_istio_up() {
   if ! kubectl -n sail-operator get deploy sail-operator >/dev/null 2>&1; then
     fail "Sail Operator not found. Run 'sail up' first to install the operator."
   fi
+
+  # Wait for Istio CRD to ensure no race
+  wait_for_istio_crd
+
+  # Ensure istio-system namespace exists
+  log "Ensuring istio-system namespace exists"
+  kubectl create namespace istio-system >/dev/null 2>&1 || true
 
   # Apply Istio CRD manifest
   manifest_file="$(dirname "$0")/manifests/istio/istio-ambient.yaml"
@@ -158,9 +242,33 @@ cmd_istio_up() {
   log "Applying Istio manifest: $manifest_file"
   kubectl apply -f "$manifest_file"
 
-  log "Waiting for Istio control plane and ingress"
-  kubectl -n istio-system rollout status deploy/istiod --timeout=300s
-  kubectl -n istio-system rollout status deploy/istio-ingressgateway --timeout=300s
+  log "Waiting for Istio control plane to be created"
+  for i in {1..60}; do
+    if kubectl -n istio-system get deploy/istiod >/dev/null 2>&1; then
+      log "istiod deployment found, waiting for rollout"
+      kubectl -n istio-system rollout status deploy/istiod --timeout=300s
+      break
+    fi
+    echo -n "."
+    sleep 5
+    if [ $i -eq 60 ]; then
+      echo # Newline
+      fail "istiod deployment not created after 5 minutes"
+    fi
+  done
+  echo # Newline
+
+  # Apply ingress gateway (ambient mode doesn't deploy it by default)
+  gateway_manifest="$(dirname "$0")/manifests/istio/ingress-gateway.yaml"
+  if [ -f "$gateway_manifest" ]; then
+    log "Applying ingress gateway manifest"
+    kubectl apply -f "$gateway_manifest"
+    log "Waiting for ingress gateway rollout"
+    kubectl -n istio-system rollout status deploy/istio-ingressgateway --timeout=300s
+  else
+    log "WARN: Ingress gateway manifest not found: $gateway_manifest"
+  fi
+
   log "Istio mesh deployed via Sail Operator"
 }
 
@@ -361,6 +469,56 @@ cmd_validate() {
   fi
 }
 
+cmd_app_deploy() {
+  check_deps_basic
+  need_envsubst
+  log "Deploying sample application with platform configuration"
+
+  # Generate app environment and export platform variables
+  generate_sample_app_env
+
+  APP_DIR="$(dirname "$0")/sample-app"
+  if [ ! -d "$APP_DIR" ]; then
+    fail "Sample app directory not found: $APP_DIR"
+  fi
+
+  # Create temporary directory for templated manifests
+  TEMP_DIR=$(mktemp -d)
+  trap 'rm -rf "$TEMP_DIR"' EXIT
+
+  log "Templating manifests with platform variables"
+
+  # Template each manifest file
+  for manifest in deployment.yaml service.yaml destinationrule.yaml; do
+    if [ -f "$APP_DIR/$manifest" ]; then
+      envsubst < "$APP_DIR/$manifest" > "$TEMP_DIR/$manifest"
+    fi
+  done
+
+  # Create ConfigMap from app .env
+  kubectl create configmap sample-app-env --from-env-file="$APP_DIR/.env" \
+    --namespace="$NAMESPACE" --dry-run=client -o yaml > "$TEMP_DIR/configmap.yaml"
+
+  log "Applying templated manifests"
+  kubectl apply -f "$TEMP_DIR/"
+
+  # Wait for deployment
+  log "Waiting for app deployment to be ready"
+  kubectl -n "$NAMESPACE" rollout status deploy/"$APP_NAME" --timeout=180s
+
+  # Auto-generate VirtualService from Service labels
+  log "Generating external routing via platform"
+  cmd_routes_reconcile
+
+  # Show app status
+  echo
+  log "Application deployed successfully:"
+  echo "  Namespace: $NAMESPACE"
+  echo "  URL: https://${REGION}-${APP_NAME}.${K3S_INGRESS_DOMAIN}"
+  echo "  Status:"
+  kubectl -n "$NAMESPACE" get pods,svc,virtualservice -l app="$APP_NAME"
+}
+
 cmd_routes_reconcile() {
   check_deps_basic
   need_envsubst
@@ -434,13 +592,37 @@ cmd_routes_reconcile() {
   echo "Reconciliation complete."
 }
 
+cmd_full_up() {
+  log "[full-up] Cluster up..."
+  cmd_up
+  log "[full-up] Installing Sail Operator..."
+  cmd_sail_up
+  log "[full-up] Deploying Istio..."
+  cmd_istio_up
+  log "[full-up] Creating TLS secret..."
+  cmd_tls_up
+  log "[full-up] Creating region namespaces/policies..."
+  cmd_regions_up
+  log "[full-up] Installing gateway..."
+  cmd_gateway_up
+  log "[full-up] Platform base build complete. Deploy sample app, then run routes reconcile as needed."
+}
+
+cmd_reset() {
+  log "[reset] Tearing down platform (down + wipe app env/cluster)..."
+  cmd_down
+  cmd_full_up
+}
+
 usage() {
   cat <<EOF
 Usage: $0 <command>
 
 Commands:
   up          Create k3d cluster with ports 80/443 mapped (Traefik disabled)
-  down        Delete the k3d cluster
+  full-up     Full end-to-end platform build (runs up, sail, istio, tls, regions, gateway)
+  reset       Teardown everything and re-run full-up (cluster, env, app)
+  down        Delete the k3d cluster and app env file
   status      Show cluster and node status (if KUBECONFIG set)
   sail up     Install Sail Operator for declarative Istio management
   istio up    Deploy Istio mesh via CRD manifest (requires Sail Operator)
@@ -448,6 +630,7 @@ Commands:
   regions up  Create region namespaces and apply zero-trust policies
   gateway up  Apply wildcard HTTPS gateway using TLS secret
   routes reconcile  Auto-generate VirtualServices from labeled Services
+  app deploy  Deploy sample application with platform configuration
   validate    Validate all components are running correctly
 
 Typical workflow:
@@ -457,8 +640,8 @@ Typical workflow:
   4. $0 tls up                # Setup TLS certificates
   5. $0 regions up            # Create region namespaces
   6. $0 gateway up            # Setup wildcard gateway
-  7. Deploy apps with compliance.routing/enabled=true labels
-  8. $0 routes reconcile      # Auto-generate routes
+  7. $0 app deploy             # Deploy sample application
+  8. $0 routes reconcile      # Auto-generate routes (optional)
 
 Env vars:
   CLUSTER_NAME        Cluster name (default: enterprise-sim)
@@ -483,6 +666,8 @@ main() {
   case "${1:-}" in
     up) shift; cmd_up "$@" ;;
     down) shift; cmd_down "$@" ;;
+    full-up) shift; cmd_full_up "$@" ;;
+    reset) shift; cmd_reset "$@" ;;
     status) shift; cmd_status "$@" ;;
     tls) shift; case "${1:-}" in up) shift; cmd_tls_up "$@" ;; *) usage ;; esac ;;
     sail) shift; case "${1:-}" in up) shift; cmd_sail_up "$@" ;; *) usage ;; esac ;;
@@ -490,6 +675,7 @@ main() {
     regions) shift; case "${1:-}" in up) shift; cmd_regions_up "$@" ;; *) usage ;; esac ;;
     gateway) shift; case "${1:-}" in up) shift; cmd_gateway_up "$@" ;; *) usage ;; esac ;;
     routes) shift; case "${1:-}" in reconcile) shift; cmd_routes_reconcile "$@" ;; *) usage ;; esac ;;
+    app) shift; case "${1:-}" in deploy) shift; cmd_app_deploy "$@" ;; *) usage ;; esac ;;
     validate) shift; cmd_validate "$@" ;;
     -h|--help|help|*) usage ;;
   esac

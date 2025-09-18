@@ -2,17 +2,17 @@
 apiVersion: networking.istio.io/v1beta1
 kind: DestinationRule
 metadata:
-  name: $(APP_NAME)-dr
-  namespace: $(NAMESPACE)
+  name: ${APP_NAME}-dr
+  namespace: ${NAMESPACE}
   labels:
-    app: $(APP_NAME)
-    compliance.region: $(REGION)
+    app: ${APP_NAME}
+    compliance.region: ${REGION}
 spec:
-  host: $(APP_NAME).$(NAMESPACE).svc.cluster.local
+  host: ${APP_NAME}.${NAMESPACE}.svc.cluster.local
   trafficPolicy:
-    # Enforce mTLS for service-to-service communication
+    # Enable mTLS for strict mode
     tls:
-      mode: ISTIO_MUTUAL  # mTLS via Istio
+      mode: ISTIO_MUTUAL
     # Load balancing and circuit breaker settings
     loadBalancer:
       simple: LEAST_CONN
@@ -26,11 +26,3 @@ spec:
       consecutiveErrors: 3
       interval: 30s
       baseEjectionTime: 30s
-  # Version-specific policies (if using canary deployments)
-  subsets:
-  - name: v1
-    labels:
-      version: v1
-    trafficPolicy:
-      tls:
-        mode: ISTIO_MUTUAL
