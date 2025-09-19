@@ -157,119 +157,27 @@ cmd_tls_up() {
   log "TLS secret ready: istio-system/$TLS_SECRET_NAME"
 }
 
-cmd_sail_up() {
-  check_deps_basic
-  check_deps_helm
-  log "Installing Sail Operator using Helm"
-
-  # Clean up any existing Istio CRDs to ensure a clean install by the operator
-  log "Checking for existing Istio CRDs..."
-  if kubectl get crd -oname | grep -q 'istio.io'; then
-    log "Deleting existing Istio CRDs to prevent conflicts..."
-    kubectl get crd -oname | grep 'istio.io' | xargs kubectl delete
-  else
-    log "No existing Istio CRDs found. Continuing..."
-  fi
-
-  # Add Sail Operator Helm repository
-  log "Adding Sail Operator Helm repository"
-  helm repo add sailoperator https://istio-ecosystem.github.io/sail-operator >/dev/null 2>&1 || true
-  helm repo update >/dev/null 2>&1
-
-  # Create namespace for Sail Operator
-  log "Creating sail-operator namespace"
-  kubectl create namespace sail-operator >/dev/null 2>&1 || true
-
-  # Install Sail Operator
-  log "Installing Sail Operator via Helm"
-  helm upgrade --install sail-operator sailoperator/sail-operator \
-    --namespace sail-operator \
-    --wait --timeout=300s
-
-  # Wait for operator deployment to be ready
-  log "Waiting for Sail Operator deployment"
-  kubectl -n sail-operator rollout status deploy/sail-operator --timeout=300s
-
-  log "Sail Operator installed successfully"
-}
-
-wait_for_istio_crd() {
-  log "Waiting for Istio CRD (sailoperator.io/v1) to be registered..."
-  for i in {1..30}; do
-    if kubectl get crd istios.sailoperator.io >/dev/null 2>&1 || \
-       kubectl get crd istios.install.istio.io >/dev/null 2>&1; then
-      log "Istio CRD is registered."
-      return 0
-    fi
-    echo -n "."
-    sleep 2
-    if [ $i -eq 30 ]; then
-      echo # Newline
-      log "Sail Operator deployment status:"
-      kubectl -n sail-operator describe deploy sail-operator || true
-      log "Recent logs from Sail Operator:"
-      kubectl -n sail-operator logs deploy/sail-operator --tail=20 || true
-      log "Existing Istio CRDs:"
-      kubectl get crds | grep -E 'istio.io|sailoperator.io' || echo "(none found)"
-      fail "Istio CRD (sailoperator.io/v1) did not appear after 60s."
-    fi
-  done
-  echo # Newline
-}
-
 cmd_istio_up() {
   check_deps_basic
-  log "Applying Istio mesh configuration via CRD manifest"
+  log "Installing Istio service mesh"
 
-  # Check if Sail Operator is running
-  if ! kubectl -n sail-operator get deploy sail-operator >/dev/null 2>&1; then
-    fail "Sail Operator not found. Run 'sail up' first to install the operator."
+  # Check if istioctl is available
+  if ! command -v istioctl >/dev/null 2>&1; then
+    fail "istioctl not found. Please install Istio CLI first."
   fi
 
-  # Wait for Istio CRD to ensure no race
-  wait_for_istio_crd
+  # Install Istio with full demo environment (control plane + ingress gateway)
+  log "Installing Istio with demo profile"
+  istioctl install --set profile=demo -y
 
-  # Ensure istio-system namespace exists
-  log "Ensuring istio-system namespace exists"
-  kubectl create namespace istio-system >/dev/null 2>&1 || true
+  # Wait for Istio deployment to be ready
+  log "Waiting for Istio control plane"
+  kubectl -n istio-system rollout status deploy/istiod --timeout=300s
 
-  # Apply Istio CRD manifest
-  manifest_file="$(dirname "$0")/manifests/istio/istio-ambient.yaml"
-  if [ ! -f "$manifest_file" ]; then
-    fail "Istio manifest not found: $manifest_file"
-  fi
+  log "Waiting for Istio ingress gateway"
+  kubectl -n istio-system rollout status deploy/istio-ingressgateway --timeout=300s
 
-  log "Applying Istio manifest: $manifest_file"
-  kubectl apply -f "$manifest_file"
-
-  log "Waiting for Istio control plane to be created"
-  for i in {1..60}; do
-    if kubectl -n istio-system get deploy/istiod >/dev/null 2>&1; then
-      log "istiod deployment found, waiting for rollout"
-      kubectl -n istio-system rollout status deploy/istiod --timeout=300s
-      break
-    fi
-    echo -n "."
-    sleep 5
-    if [ $i -eq 60 ]; then
-      echo # Newline
-      fail "istiod deployment not created after 5 minutes"
-    fi
-  done
-  echo # Newline
-
-  # Apply ingress gateway (ambient mode doesn't deploy it by default)
-  gateway_manifest="$(dirname "$0")/manifests/istio/ingress-gateway.yaml"
-  if [ -f "$gateway_manifest" ]; then
-    log "Applying ingress gateway manifest"
-    kubectl apply -f "$gateway_manifest"
-    log "Waiting for ingress gateway rollout"
-    kubectl -n istio-system rollout status deploy/istio-ingressgateway --timeout=300s
-  else
-    log "WARN: Ingress gateway manifest not found: $gateway_manifest"
-  fi
-
-  log "Istio mesh deployed via Sail Operator"
+  log "Istio installed successfully"
 }
 
 ensure_region_ns() {
@@ -595,8 +503,7 @@ cmd_routes_reconcile() {
 cmd_full_up() {
   log "[full-up] Cluster up..."
   cmd_up
-  log "[full-up] Installing Sail Operator..."
-  cmd_sail_up
+  log "[full-up] Installing Istio..."
   log "[full-up] Deploying Istio..."
   cmd_istio_up
   log "[full-up] Creating TLS secret..."
@@ -620,12 +527,11 @@ Usage: $0 <command>
 
 Commands:
   up          Create k3d cluster with ports 80/443 mapped (Traefik disabled)
-  full-up     Full end-to-end platform build (runs up, sail, istio, tls, regions, gateway)
+  full-up     Full end-to-end platform build (runs up, istio, tls, regions, gateway)
   reset       Teardown everything and re-run full-up (cluster, env, app)
   down        Delete the k3d cluster and app env file
   status      Show cluster and node status (if KUBECONFIG set)
-  sail up     Install Sail Operator for declarative Istio management
-  istio up    Deploy Istio mesh via CRD manifest (requires Sail Operator)
+  istio up    Install Istio service mesh with demo profile
   tls up      Create self-signed wildcard TLS secret in istio-system
   regions up  Create region namespaces and apply zero-trust policies
   gateway up  Apply wildcard HTTPS gateway using TLS secret
@@ -635,13 +541,12 @@ Commands:
 
 Typical workflow:
   1. $0 up                    # Create cluster
-  2. $0 sail up               # Install Sail Operator
-  3. $0 istio up              # Deploy Istio mesh declaratively
-  4. $0 tls up                # Setup TLS certificates
-  5. $0 regions up            # Create region namespaces
-  6. $0 gateway up            # Setup wildcard gateway
-  7. $0 app deploy             # Deploy sample application
-  8. $0 routes reconcile      # Auto-generate routes (optional)
+  2. $0 istio up              # Install Istio service mesh
+  3. $0 tls up                # Setup TLS certificates
+  4. $0 regions up            # Create region namespaces
+  5. $0 gateway up            # Setup wildcard gateway
+  6. $0 app deploy             # Deploy sample application
+  7. $0 routes reconcile      # Auto-generate routes (optional)
 
 Env vars:
   CLUSTER_NAME        Cluster name (default: enterprise-sim)
@@ -652,13 +557,13 @@ Env vars:
 
 Dependencies:
   - k3d, kubectl, jq (basic operations)
-  - helm (for Sail Operator installation)
+  - istioctl (for Istio installation)
   - envsubst (for templating)
 
 Notes:
   - After 'up', export KUBECONFIG from the path printed to use kubectl.
-  - Istio is now managed declaratively via Sail Operator, no istioctl required.
-  - All mesh configuration is in manifests/istio/istio-ambient.yaml
+  - Istio is installed using istioctl with demo profile.
+  - Multi-region namespace isolation with zero-trust security policies.
 EOF
 }
 
@@ -670,7 +575,6 @@ main() {
     reset) shift; cmd_reset "$@" ;;
     status) shift; cmd_status "$@" ;;
     tls) shift; case "${1:-}" in up) shift; cmd_tls_up "$@" ;; *) usage ;; esac ;;
-    sail) shift; case "${1:-}" in up) shift; cmd_sail_up "$@" ;; *) usage ;; esac ;;
     istio) shift; case "${1:-}" in up) shift; cmd_istio_up "$@" ;; *) usage ;; esac ;;
     regions) shift; case "${1:-}" in up) shift; cmd_regions_up "$@" ;; *) usage ;; esac ;;
     gateway) shift; case "${1:-}" in up) shift; cmd_gateway_up "$@" ;; *) usage ;; esac ;;
